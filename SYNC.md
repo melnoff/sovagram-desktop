@@ -9,12 +9,12 @@ specific upstream commit. Our changes live as `git format-patch` files in
 ```
 tdesktop/                     git submodule, pinned to an upstream SHA
 patches/
-  vless/                      each folder is one logical patch set
-  sovagram-branding/
-  ui-hide-round-videos/
-  sovagram-updater/
+  01-vless/                   each folder is one logical patch set
+  02-sovagram-branding/       numeric prefix = canonical apply order
+  03-ui-hide-round-videos/
+  04-sovagram-updater/
 resources/logo.png            source icon, overlaid into tdesktop/ at build
-.sync/patches.txt             apply order
+.sync/patches.txt             apply order (authoritative)
 ```
 
 ## Apply order
@@ -22,6 +22,19 @@ resources/logo.png            source icon, overlaid into tdesktop/ at build
 `.sync/patches.txt` — plain text, one `patches/<name>` per line, applied top
 to bottom. Comments start with `#`. To disable a patch temporarily, comment
 the line.
+
+The numeric prefixes on folder names (`01-`, `02-`, …) are informational
+and should match the order in `patches.txt`. Renumber both when inserting
+a new patch into the middle of the stack.
+
+## Branches
+
+- `master` — current working build; tracks the latest upstream stable tag
+  that our patches apply cleanly onto.
+- `v<N>` (e.g. `v6.7.5`) — snapshot of `master` at the time it was pinned
+  to upstream tag `v<N>`. Created automatically by the sync workflow
+  right before advancing to a newer tag. Frozen once created.
+- `sovagram-YYYYMMDD-<sha>` — release tags created by the release workflow.
 
 ## Build flow (what CI does)
 
@@ -47,11 +60,17 @@ the line.
    is behind (won't rewind).
 3. Checks out the submodule to the new tag.
 4. For each `patches/<name>` in order, runs `git am --3way`. If any fails,
-   opens an issue and stops without touching `main`.
-5. On success, regenerates patches from the applied commits (so stored
-   patches carry fresh context lines), rewinds the submodule to the clean
-   upstream tag, commits the submodule-pointer bump + refreshed patches,
-   and pushes to `main`.
+   opens an issue and stops without touching `master`.
+5. On success:
+   a. Regenerates patches from the applied commits (so stored patches
+      carry fresh context lines from the new upstream).
+   b. Rewinds the submodule back to the clean upstream tag.
+   c. Creates a snapshot branch named after the PREVIOUS upstream ref
+      (e.g. `v6.7.5`) pointing at the pre-sync `master` head, so the
+      state that was current for each upstream version is preserved.
+      Existing snapshot branches are left untouched.
+   d. Commits the submodule-pointer bump + refreshed patches and pushes
+      to `master`.
 6. Triggers the build workflow.
 
 Uses only the built-in `GITHUB_TOKEN`. No PAT required.
@@ -64,7 +83,7 @@ Easiest: work inside the submodule.
 cd tdesktop
 git checkout -b my-feature
 # ... make changes, commit one or more times ...
-git format-patch --binary main..HEAD -o ../patches/my-feature/
+git format-patch --binary master..HEAD -o ../patches/my-feature/
 cd ..
 # Add 'my-feature' in the right spot in .sync/patches.txt
 git add tdesktop patches/my-feature .sync/patches.txt

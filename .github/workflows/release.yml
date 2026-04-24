@@ -3,7 +3,7 @@ name: Release
 on:
   workflow_run:
     workflows: ["Build"]
-    branches: [main]
+    branches: [master]
     types: [completed]
   workflow_dispatch:
 
@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: master
           fetch-depth: 0
 
       - name: Resolve source run
@@ -37,9 +37,9 @@ jobs:
             RUN_ID="${{ github.event.workflow_run.id }}"
             SRC_SHA="${{ github.event.workflow_run.head_sha }}"
           else
-            RUN_ID=$(gh run list --workflow Build --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+            RUN_ID=$(gh run list --workflow Build --branch master --status success --limit 1 --json databaseId --jq '.[0].databaseId')
             if [ -z "$RUN_ID" ]; then
-              echo "::error::No successful build run found on main"; exit 1
+              echo "::error::No successful build run found on master"; exit 1
             fi
             SRC_SHA=$(gh run view "$RUN_ID" --json headSha --jq '.headSha')
           fi
@@ -97,7 +97,7 @@ jobs:
           gh release create "${{ steps.tag.outputs.name }}" \
             --target "${{ steps.src.outputs.sha }}" \
             --title "Sovagram ${{ steps.tag.outputs.name }}" \
-            --notes "Automated build from commit ${{ steps.src.outputs.sha }} on main.
+            --notes "Automated build from commit ${{ steps.src.outputs.sha }} on master.
 
           To update: download **Sovagram.exe** below and replace your current one (also grab **singbox.dll** if you use VLESS proxy).
 

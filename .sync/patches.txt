@@ -1,8 +1,11 @@
 # Patches applied to the tdesktop submodule in this order.
 # Each name maps to patches/<name>/*.patch, applied via `git am --3way`.
 # Lines starting with # and blank lines are ignored.
+#
+# The numeric prefixes reflect the canonical apply order; keep this file
+# sorted accordingly so the list and the folder names don't drift.
 
-vless
-sovagram-branding
-ui-hide-round-videos
-sovagram-updater
+01-vless
+02-sovagram-branding
+03-ui-hide-round-videos
+04-sovagram-updater

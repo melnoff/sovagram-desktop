@@ -14,12 +14,12 @@ Comes with **ABSOLUTELY NO WARRANTY**, to the extent permitted by applicable law
 
 ```
 .
-├── .github/workflows/     our CI (build, sync-upstream, release)
-├── .sync/patches.txt      patch apply order
-├── patches/<name>/*.patch git-am patches applied to tdesktop/
-├── resources/logo.png     source icon (scaled to all sizes in CI)
-├── tdesktop/              git submodule, pinned to an upstream commit
-├── SYNC.md                how upstream sync works
+├── .github/workflows/        our CI (build, sync-upstream, release)
+├── .sync/patches.txt         patch apply order
+├── patches/NN-<name>/*.patch git-am patches applied to tdesktop/ in order
+├── resources/logo.png        source icon (scaled to all sizes in CI)
+├── tdesktop/                 git submodule, pinned to an upstream commit
+├── SYNC.md                   how upstream sync works
 └── README.md
 ```
 

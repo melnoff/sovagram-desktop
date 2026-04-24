@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MAIN_BRANCH: main
+  MASTER_BRANCH: master
   PATCHES_FILE: .sync/patches.txt
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.MAIN_BRANCH }}
+          ref: ${{ env.MASTER_BRANCH }}
           submodules: true
           fetch-depth: 0
 
@@ -69,18 +69,28 @@ jobs:
           SHA=$(git rev-parse "$REF")
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve previous upstream ref (for snapshot branch)
+        id: prev
+        run: |
+          cd tdesktop
+          PREV_SHA=$(git rev-parse HEAD)
+          PREV_REF=$(git describe --tags --exact-match HEAD 2>/dev/null \
+            || git describe --tags --always HEAD)
+          echo "ref=$PREV_REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
           {
-            echo "## Sync target"
-            echo "- ref: \`$REF\`"
-            echo "- sha: \`$SHA\`"
+            echo "## Sync"
+            echo "- from submodule ref: \`$PREV_REF\` ($PREV_SHA)"
+            echo "- to target ref:      \`${{ steps.target.outputs.ref }}\` (${{ steps.target.outputs.sha }})"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Decide if advance is needed
         id: need
         run: |
           cd tdesktop
-          CURRENT=$(git rev-parse HEAD)
           TARGET="${{ steps.target.outputs.sha }}"
+          CURRENT="${{ steps.prev.outputs.sha }}"
           if [ "$CURRENT" = "$TARGET" ]; then
             echo "status=current" >> "$GITHUB_OUTPUT"
           elif git merge-base --is-ancestor "$TARGET" "$CURRENT"; then
@@ -125,11 +135,9 @@ jobs:
         if: steps.apply.outputs.status == 'ok'
         run: |
           cd tdesktop
-          # Count how many commits were applied (= total patches in config).
           TOTAL=$(grep -Ev '^\s*(#|$)' ../$PATCHES_FILE | wc -l)
           git format-patch --binary -$TOTAL -o ../patches-new/ HEAD
           cd ..
-          # Reconstruct per-patch folders from the linear series.
           IDX=1
           for p in ${{ steps.patches.outputs.list }}; do
             rm -f patches/$p/*.patch
@@ -138,26 +146,42 @@ jobs:
             IDX=$((IDX+1))
           done
           rm -rf patches-new
-          # Rewind tdesktop to the target (submodule should point at upstream SHA, not patched head).
           cd tdesktop
           git checkout --detach "${{ steps.target.outputs.sha }}"
 
-      - name: Commit + push
+      - name: Create snapshot branch of previous master
+        if: steps.apply.outputs.status == 'ok' && github.event.inputs.dry_run != 'true'
+        id: snapshot
+        run: |
+          SNAP_NAME="${{ steps.prev.outputs.ref }}"
+          OLD_MASTER_SHA=$(git rev-parse "origin/$MASTER_BRANCH")
+          if git ls-remote --heads origin "refs/heads/$SNAP_NAME" | grep -q .; then
+            echo "Snapshot branch \`$SNAP_NAME\` already exists; leaving it frozen." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "status=existing" >> "$GITHUB_OUTPUT"
+          else
+            git push origin "$OLD_MASTER_SHA:refs/heads/$SNAP_NAME"
+            echo "Created snapshot branch \`$SNAP_NAME\` at $OLD_MASTER_SHA." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "status=created" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit + push master
         if: steps.apply.outputs.status == 'ok' && github.event.inputs.dry_run != 'true'
         run: |
           git add tdesktop patches/
           if git diff --cached --quiet; then
             echo "No changes to commit." >> "$GITHUB_STEP_SUMMARY"
           else
-            git commit -m "sync: bump tdesktop to ${{ steps.target.outputs.ref }}, refresh patches"
-            git push origin "$MAIN_BRANCH"
+            git commit -m "sync: tdesktop ${{ steps.prev.outputs.ref }} -> ${{ steps.target.outputs.ref }}, refresh patches"
+            git push origin "$MASTER_BRANCH"
           fi
 
       - name: Trigger build
         if: steps.apply.outputs.status == 'ok' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run build.yml --ref "$MAIN_BRANCH"
+        run: gh workflow run build.yml --ref "$MASTER_BRANCH"
 
       - name: Open conflict issue
         if: steps.apply.outputs.status == 'conflict'
@@ -175,13 +199,14 @@ jobs:
               ``,
               ...failed.map(p => `- \`patches/${p}\``),
               ``,
-              `Resolve manually:`,
+              `Resolve manually (local workflow):`,
               `\`\`\`bash`,
               `cd tdesktop && git fetch origin --tags && git checkout ${target}`,
               ...failed.map(p => `git am --3way ../patches/${p}/*.patch  # resolve, git am --continue`),
-              `cd .. && git format-patch --binary -<N> -o patches-new/ tdesktop/HEAD`,
-              `# redistribute patches into patches/<name>/ folders`,
-              `git add tdesktop patches/ && git commit -m "sync: bump to ${target}" && git push`,
+              `cd ..`,
+              `# Save the old state under its upstream ref name:`,
+              `git push origin origin/master:refs/heads/<previous-upstream-ref>`,
+              `# Regenerate patches, bump submodule pointer, push master.`,
               `\`\`\``,
               ``,
               `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
