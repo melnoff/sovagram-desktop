@@ -1,0 +1,199 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  singbox:
+    name: Build singbox.dll
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply VLESS patch (for singbox sources)
+        shell: bash
+        run: |
+          cd tdesktop
+          git config user.email "build-bot@users.noreply.github.com"
+          git config user.name "build-bot"
+          git am --3way --keep-cr ../patches/vless/*.patch
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build singbox.dll (CGO + MinGW)
+        shell: cmd
+        run: |
+          set CGO_ENABLED=1
+          set GOOS=windows
+          set GOARCH=amd64
+          set CC=gcc
+          cd tdesktop\Telegram\ThirdParty\singbox_bridge
+          go mod tidy
+          go build -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api" -buildmode=c-shared -ldflags="-s -w" -o singbox.dll .
+          dir singbox.dll singbox.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: singbox-dll
+          path: |
+            tdesktop/Telegram/ThirdParty/singbox_bridge/singbox.dll
+            tdesktop/Telegram/ThirdParty/singbox_bridge/singbox.h
+          retention-days: 7
+
+  sovagram:
+    name: Sovagram (x64 + qt6 + Ninja)
+    needs: singbox
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Checkout sovagram-desktop
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Read patches config
+        shell: bash
+        id: patches
+        run: |
+          LIST=$(grep -Ev '^\s*(#|$)' .sync/patches.txt | tr '\n' ' ')
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "Patches: $LIST"
+
+      - name: Apply patches to tdesktop
+        shell: bash
+        run: |
+          cd tdesktop
+          git config user.email "build-bot@users.noreply.github.com"
+          git config user.name "build-bot"
+          for p in ${{ steps.patches.outputs.list }}; do
+            echo "::group::Apply patches/$p"
+            git am --3way --keep-cr ../patches/$p/*.patch
+            echo "::endgroup::"
+          done
+
+      - name: Overlay resources (logo)
+        shell: bash
+        run: |
+          cp resources/logo.png tdesktop/Telegram/Resources/art/logo.png
+
+      - name: Install ImageMagick
+        run: choco install -y imagemagick --no-progress
+
+      - name: Generate app icons from logo.png
+        shell: bash
+        run: |
+          ART="tdesktop/Telegram/Resources/art"
+          MAGICK="$(command -v magick)"
+          for base in 16 32 48 64 128 256 512; do
+            "$MAGICK" "$ART/logo.png" -resize ${base}x${base} "$ART/icon${base}.png"
+            "$MAGICK" "$ART/logo.png" -resize $((base*2))x$((base*2)) "$ART/icon${base}@2x.png"
+          done
+          "$MAGICK" "$ART/logo.png" \
+            -define icon:auto-resize=16,20,24,32,40,48,64,96,128,256 \
+            "$ART/icon256.ico"
+
+      - name: Prepare TBuild dirs
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries>>%GITHUB_ENV%
+          mklink /j %TBUILD%\tdesktop %GITHUB_WORKSPACE%\tdesktop
+
+      - name: Read cache key
+        shell: bash
+        run: |
+          echo "CACHE_KEY=$(sha256sum tdesktop/Telegram/build/prepare/prepare.py | cut -d' ' -f1)" >> $GITHUB_ENV
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: Windows-x64-third-party-${{ env.CACHE_KEY }}
+          restore-keys: Windows-x64-third-party-
+
+      - name: Libraries cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+          key: Windows-x64-libs-${{ env.CACHE_KEY }}
+          restore-keys: Windows-x64-libs-
+
+      - name: Libraries (prepare.py)
+        env:
+          GYP_MSVS_OVERRIDE_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\'
+          GYP_MSVS_VERSION: 2022
+        run: |
+          %TBUILD%\tdesktop\Telegram\build\prepare\win.bat skip-release silent qt6
+
+      - name: Free up some disk space
+        shell: bash
+        run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: Pull singbox.dll artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: singbox-dll
+          path: tdesktop/Telegram/ThirdParty/singbox_bridge/
+
+      - name: Sovagram build
+        run: |
+          cd %TBUILD%\tdesktop\Telegram
+          call configure.bat ^
+          -G "Ninja Multi-Config" ^
+          qt6 ^
+          -D TDESKTOP_API_TEST=ON ^
+          -D CMAKE_CONFIGURATION_TYPES=Debug ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
+          -D SOVAGRAM_BUILD_ID=%GITHUB_SHA%
+          cmake --build ..\out --config Debug --parallel 4
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          BUILD_DIR="$TBUILD/tdesktop/out/Debug"
+          if [ -f "$BUILD_DIR/Sovagram.exe" ]; then
+            cp "$BUILD_DIR/Sovagram.exe" artifact/
+          else
+            cp "$BUILD_DIR/Telegram.exe" artifact/
+          fi
+          cp "$BUILD_DIR/Updater.exe" artifact/
+          cp tdesktop/Telegram/ThirdParty/singbox_bridge/singbox.dll artifact/
+          ls -la artifact/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sovagram-x64-qt6-${{ github.sha }}
+          path: artifact/
+          retention-days: 14

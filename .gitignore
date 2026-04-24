@@ -1,0 +1,15 @@
+# Sovagram fork — root .gitignore
+# The tdesktop submodule carries its own .gitignore; nothing else should leak.
+
+# CI build scratch
+out/
+build/
+artifact/
+*.zip
+
+# OS/IDE noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.user

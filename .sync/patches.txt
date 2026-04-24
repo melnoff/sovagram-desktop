@@ -1,0 +1,8 @@
+# Patches applied to the tdesktop submodule in this order.
+# Each name maps to patches/<name>/*.patch, applied via `git am --3way`.
+# Lines starting with # and blank lines are ignored.
+
+vless
+sovagram-branding
+ui-hide-round-videos
+sovagram-updater

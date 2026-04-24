@@ -1,0 +1,165 @@
+From 92bc4ec1fcfc5169e305d513a9b043bb26b14b67 Mon Sep 17 00:00:00 2001
+From: Ivan Melnikov <mail@melnoff.com>
+Date: Fri, 24 Apr 2026 23:44:48 +0300
+Subject: [PATCH] feat(ui): toggle to hide round video messages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a user-facing preference (stored via writePref/readPref) that
+hides video-note messages ("кружки") from chat views. When enabled,
+the Element hides itself via HiddenByUserPref flag, so it is skipped
+in scroll height and rendering just like HiddenByGroup items.
+
+Setting toggle lives in Advanced settings under a new subsection.
+---
+ Telegram/Resources/langs/lang.strings         |  3 ++
+ Telegram/SourceFiles/core/core_settings.h     |  3 ++
+ .../history/view/history_view_element.cpp     | 15 ++++++--
+ .../history/view/history_view_element.h       |  1 +
+ .../settings/sections/settings_advanced.cpp   | 35 +++++++++++++++++++
+ 5 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 226614677b..39234321bd 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -7023,6 +7023,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ "lng_screen_reader_settings_title" = "Screen reader";
+ "lng_screen_reader_settings_disable" = "Disable screen reader mode";
+ 
++"lng_settings_round_videos_section" = "Video messages";
++"lng_settings_hide_round_videos" = "Hide round video messages";
++
+ "lng_filters_all" = "All chats";
+ "lng_filters_all_short" = "All";
+ "lng_filters_setup" = "Edit";
+diff --git a/Telegram/SourceFiles/core/core_settings.h b/Telegram/SourceFiles/core/core_settings.h
+index 26da92fd8f..4e73983a9c 100644
+--- a/Telegram/SourceFiles/core/core_settings.h
++++ b/Telegram/SourceFiles/core/core_settings.h
+@@ -39,6 +39,9 @@ namespace Core {
+ inline constexpr auto kScreenReaderModeDisabledKey
+ 	= "screen-reader-mode-disabled"_cs;
+ 
++inline constexpr auto kHideRoundVideosKey
++	= "hide-round-videos"_cs;
++
+ struct WindowPosition {
+ 	int32 moncrc = 0;
+ 	int maximized = 0;
+diff --git a/Telegram/SourceFiles/history/view/history_view_element.cpp b/Telegram/SourceFiles/history/view/history_view_element.cpp
+index a9525e2493..a57d87b0f0 100644
+--- a/Telegram/SourceFiles/history/view/history_view_element.cpp
++++ b/Telegram/SourceFiles/history/view/history_view_element.cpp
+@@ -52,6 +52,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "data/components/sponsored_messages.h"
+ #include "data/data_channel.h"
+ #include "data/data_saved_sublist.h"
++#include "data/data_document.h"
++#include "data/data_media_types.h"
+ #include "data/data_session.h"
+ #include "data/data_todo_list.h"
+ #include "data/data_forum.h"
+@@ -1423,7 +1425,7 @@ bool Element::isHiddenByGroup() const {
+ }
+ 
+ bool Element::isHidden() const {
+-	return isHiddenByGroup();
++	return isHiddenByGroup() || (_flags & Flag::HiddenByUserPref);
+ }
+ 
+ void Element::overrideMedia(std::unique_ptr<Media> media) {
+@@ -1505,7 +1507,7 @@ void Element::refreshMedia(Element *replacing) {
+ 	if (_flags & Flag::MediaOverriden) {
+ 		return;
+ 	}
+-	_flags &= ~Flag::HiddenByGroup;
++	_flags &= ~(Flag::HiddenByGroup | Flag::HiddenByUserPref);
+ 
+ 	const auto item = data();
+ 	if (!item->computeUnavailableReason().isEmpty()) {
+@@ -1513,6 +1515,15 @@ void Element::refreshMedia(Element *replacing) {
+ 		return;
+ 	}
+ 	if (const auto media = item->media()) {
++		if (const auto document = media->document()) {
++			if (document->isVideoMessage()
++				&& Core::App().settings().readPref<bool>(
++					Core::kHideRoundVideosKey)) {
++				_media = nullptr;
++				_flags |= Flag::HiddenByUserPref;
++				return;
++			}
++		}
+ 		if (media->canBeGrouped()) {
+ 			if (const auto group = history()->owner().groups().find(item)) {
+ 				if (group->items.front() != item) {
+diff --git a/Telegram/SourceFiles/history/view/history_view_element.h b/Telegram/SourceFiles/history/view/history_view_element.h
+index b95b8371b6..49102d28f5 100644
+--- a/Telegram/SourceFiles/history/view/history_view_element.h
++++ b/Telegram/SourceFiles/history/view/history_view_element.h
+@@ -416,6 +416,7 @@ public:
+ 		MediaOverriden           = 0x0800,
+ 		HeavyCustomEmoji         = 0x1000,
+ 		SummaryShown             = 0x2000,
++		HiddenByUserPref         = 0x4000,
+ 	};
+ 	using Flags = base::flags<Flag>;
+ 	friend inline constexpr auto is_flag_type(Flag) { return true; }
+diff --git a/Telegram/SourceFiles/settings/sections/settings_advanced.cpp b/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
+index ece7d62581..998e133cea 100644
+--- a/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
++++ b/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
+@@ -1181,6 +1181,40 @@ void BuildExportSection(SectionBuilder &builder) {
+ 	});
+ }
+ 
++void BuildRoundVideosSection(SectionBuilder &builder) {
++	builder.addDivider();
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"advanced/round_videos"_q,
++		.title = tr::lng_settings_round_videos_section(),
++		.keywords = { u"round"_q, u"video"_q, u"notes"_q, u"circles"_q },
++	});
++
++	const auto toggle = builder.addButton({
++		.id = u"advanced/round_videos_hide"_q,
++		.title = tr::lng_settings_hide_round_videos(),
++		.st = &st::settingsButtonNoIcon,
++		.toggled = rpl::single(Core::App().settings().readPref<bool>(
++			Core::kHideRoundVideosKey)),
++		.keywords = { u"round"_q, u"video"_q, u"notes"_q, u"circles"_q },
++	});
++
++	if (toggle) {
++		toggle->toggledValue(
++		) | rpl::filter([=](bool value) {
++			return (value != Core::App().settings().readPref<bool>(
++				Core::kHideRoundVideosKey));
++		}) | rpl::on_next([=](bool value) {
++			Core::App().settings().writePref<bool>(
++				Core::kHideRoundVideosKey,
++				value);
++			Core::App().saveSettingsDelayed();
++		}, toggle->lifetime());
++	}
++
++	builder.addSkip();
++}
++
+ void BuildScreenReaderSection(SectionBuilder &builder) {
+ 	const auto detected = base::ScreenReaderState::Instance()->active();
+ 	const auto disabled = Ui::ScreenReaderModeDisabled();
+@@ -1253,6 +1287,7 @@ const auto kMeta = BuildHelper({
+ 	BuildSystemIntegrationSection(builder);
+ 	BuildPerformanceSection(builder);
+ 	BuildSpellcheckerSection(builder);
++	BuildRoundVideosSection(builder);
+ 	BuildScreenReaderSection(builder);
+ 	if (autoUpdate) {
+ 		BuildUpdateSection(builder, false);
+-- 
+2.54.0.windows.1
+

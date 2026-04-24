@@ -1,0 +1,148 @@
+From 2ed0c45c7b2780721c598ef38b1b54da421635fc Mon Sep 17 00:00:00 2001
+From: Ivan Melnikov <mail@melnoff.com>
+Date: Sat, 25 Apr 2026 00:09:51 +0300
+Subject: [PATCH] feat(branding): Sovagram rename, logo, About GPL attribution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Rename AppName/AppFile -> Sovagram (changes data path to
+  %APPDATA%/Sovagram/, display name in various places).
+- Rename Windows AppUserModelID -> Sovagram.Sovagram.
+- CMake OUTPUT_NAME = Sovagram so the produced binary is Sovagram.exe
+  (the 'Telegram' CMake target name stays, minimizing diff).
+- About dialog: title set to 'Sovagram', GitHub link points to the
+  fork, two new lines added:
+    - lng_about_sovagram: fork status + upstream attribution + NO
+      WARRANTY notice (GPLv3 §5 Appropriate Legal Notices).
+    - lng_about_components: lists bundled fork features.
+- Add Telegram/Resources/art/logo.png as the master logo. The build
+  workflow will generate all required .png/.ico sizes from it.
+
+Keeps tg:// protocol handler and original file-header copyrights
+intact. Original .lang strings about the Telegram service and API
+are left unchanged because they describe the service, not the
+client.
+---
+ Telegram/CMakeLists.txt                       |  1 +
+ Telegram/Resources/langs/lang.strings         |  2 ++
+ Telegram/SourceFiles/boxes/about_box.cpp      | 28 +++++++++++++++++--
+ Telegram/SourceFiles/core/version.h           |  4 +--
+ .../win/windows_app_user_model_id.cpp         |  4 +--
+ 5 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index a1fae40a00..338d860005 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -2136,6 +2136,7 @@ else()
+ endif()
+ 
+ set_target_properties(Telegram PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${output_folder})
++set_target_properties(Telegram PROPERTIES OUTPUT_NAME "Sovagram")
+ 
+ if (MSVC)
+     target_link_libraries(Telegram
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 226614677b..f95430870a 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -5539,6 +5539,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ "lng_about_text2" = "This software is licensed under {gpl_link} version 3.\nSource code is available on {github_link}.";
+ "lng_about_text3" = "Visit the {faq_link} for more info.";
+ "lng_about_text3_faq" = "Telegram FAQ";
++"lng_about_sovagram" = "Sovagram is an unofficial fork based on {upstream_link} by Telegram FZ-LLC. Fork source: {fork_link}.\nThis program comes with ABSOLUTELY NO WARRANTY, to the extent permitted by applicable law.";
++"lng_about_components" = "Bundled components: {components}.";
+ "lng_about_done" = "Done";
+ 
+ "lng_search_no_results" = "No messages found";
+diff --git a/Telegram/SourceFiles/boxes/about_box.cpp b/Telegram/SourceFiles/boxes/about_box.cpp
+index 738ad20837..df800ebc3d 100644
+--- a/Telegram/SourceFiles/boxes/about_box.cpp
++++ b/Telegram/SourceFiles/boxes/about_box.cpp
+@@ -49,7 +49,7 @@ rpl::producer<TextWithEntities> Text2() {
+ 		lt_github_link,
+ 		rpl::single(tr::link(
+ 			"GitHub",
+-			"https://github.com/telegramdesktop/tdesktop")),
++			"https://github.com/melnoff/sovagram-desktop")),
+ 		tr::marked);
+ }
+ 
+@@ -60,10 +60,32 @@ rpl::producer<TextWithEntities> Text3() {
+ 		tr::marked);
+ }
+ 
++rpl::producer<TextWithEntities> TextSovagram() {
++	return tr::lng_about_sovagram(
++		lt_upstream_link,
++		rpl::single(tr::link(
++			"Telegram Desktop",
++			"https://github.com/telegramdesktop/tdesktop")),
++		lt_fork_link,
++		rpl::single(tr::link(
++			"github.com/melnoff/sovagram-desktop",
++			"https://github.com/melnoff/sovagram-desktop")),
++		tr::marked);
++}
++
++rpl::producer<TextWithEntities> TextComponents() {
++	return tr::lng_about_components(
++		lt_components,
++		rpl::single(TextWithEntities{
++			u"VLESS proxy support via bundled sing-box"_q
++		}),
++		tr::marked);
++}
++
+ } // namespace
+ 
+ void AboutBox(not_null<Ui::GenericBox*> box) {
+-	box->setTitle(u"Telegram Desktop"_q);
++	box->setTitle(u"Sovagram"_q);
+ 
+ 	auto layout = box->verticalLayout();
+ 
+@@ -125,6 +147,8 @@ void AboutBox(not_null<Ui::GenericBox*> box) {
+ 	addText(Text1());
+ 	addText(Text2());
+ 	addText(Text3());
++	addText(TextSovagram());
++	addText(TextComponents());
+ 
+ 	box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+ 
+diff --git a/Telegram/SourceFiles/core/version.h b/Telegram/SourceFiles/core/version.h
+index 944baf38af..c63a2186ac 100644
+--- a/Telegram/SourceFiles/core/version.h
++++ b/Telegram/SourceFiles/core/version.h
+@@ -20,8 +20,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ // used in Updater.cpp and Setup.iss for Windows
+ constexpr auto AppId = "{53F49750-6209-4FBF-9CA8-7A333C87D1ED}"_cs;
+ constexpr auto AppNameOld = "Telegram Win (Unofficial)"_cs;
+-constexpr auto AppName = "Telegram Desktop"_cs;
+-constexpr auto AppFile = "Telegram"_cs;
++constexpr auto AppName = "Sovagram"_cs;
++constexpr auto AppFile = "Sovagram"_cs;
+ constexpr auto AppVersion = 6007005;
+ constexpr auto AppVersionStr = "6.7.5";
+ constexpr auto AppBetaVersion = false;
+diff --git a/Telegram/SourceFiles/platform/win/windows_app_user_model_id.cpp b/Telegram/SourceFiles/platform/win/windows_app_user_model_id.cpp
+index 3d051f4ce0..5eaf831764 100644
+--- a/Telegram/SourceFiles/platform/win/windows_app_user_model_id.cpp
++++ b/Telegram/SourceFiles/platform/win/windows_app_user_model_id.cpp
+@@ -26,9 +26,9 @@ const PROPERTYKEY pkey_AppUserModel_StartPinOption = { { 0x9F4C2855, 0x9F79, 0x4
+ const PROPERTYKEY pkey_AppUserModel_ToastActivator = { { 0x9F4C2855, 0x9F79, 0x4B39, { 0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3 } }, 26 };
+ 
+ #ifdef OS_WIN_STORE
+-const WCHAR AppUserModelIdBase[] = L"Telegram.TelegramDesktop.Store";
++const WCHAR AppUserModelIdBase[] = L"Sovagram.Sovagram.Store";
+ #else // OS_WIN_STORE
+-const WCHAR AppUserModelIdBase[] = L"Telegram.TelegramDesktop";
++const WCHAR AppUserModelIdBase[] = L"Sovagram.Sovagram";
+ #endif // OS_WIN_STORE
+ 
+ [[nodiscard]] QString PinnedIconsPath() {
+-- 
+2.54.0.windows.1
+

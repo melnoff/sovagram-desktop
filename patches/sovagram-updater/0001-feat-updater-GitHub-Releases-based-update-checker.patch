@@ -1,0 +1,273 @@
+From 92c934424d064585f0acddced199847ddf6aef7e Mon Sep 17 00:00:00 2001
+From: Ivan Melnikov <mail@melnoff.com>
+Date: Sat, 25 Apr 2026 00:16:32 +0300
+Subject: [PATCH] feat(updater): GitHub Releases-based update checker
+
+Adds Core::SovagramUpdater: on startup (30s delay), queries
+api.github.com/repos/<SOVAGRAM_RELEASES_REPO>/releases/latest,
+compares tag_name against the compile-time SOVAGRAM_BUILD_ID.
+If different, shows a confirm box with a link to the release page
+for manual download.
+
+CMake: SOVAGRAM_BUILD_ID is auto-populated from the GITHUB_SHA env
+var when building inside GitHub Actions, or can be passed manually
+via -D SOVAGRAM_BUILD_ID=<sha>. SOVAGRAM_RELEASES_REPO defaults to
+melnoff/tdesktop and can be overridden via -D.
+
+If SOVAGRAM_BUILD_ID is empty (local dev), the check is skipped.
+Does not touch the original desktop.telegram.org updater, which
+simply never finds valid signed updates for our unofficial build.
+---
+ Telegram/CMakeLists.txt                       |  14 ++
+ Telegram/Resources/langs/lang.strings         |   5 +
+ Telegram/SourceFiles/core/application.cpp     |   3 +
+ .../SourceFiles/core/sovagram_updater.cpp     | 148 ++++++++++++++++++
+ Telegram/SourceFiles/core/sovagram_updater.h  |  12 ++
+ 5 files changed, 182 insertions(+)
+ create mode 100644 Telegram/SourceFiles/core/sovagram_updater.cpp
+ create mode 100644 Telegram/SourceFiles/core/sovagram_updater.h
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index a1fae40a00..cc971ea4c2 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -547,6 +547,8 @@ PRIVATE
+     core/sandbox.h
+     core/shortcuts.cpp
+     core/shortcuts.h
++    core/sovagram_updater.cpp
++    core/sovagram_updater.h
+     core/ui_integration.cpp
+     core/ui_integration.h
+     core/update_checker.cpp
+@@ -2125,6 +2127,18 @@ PRIVATE
+     G_LOG_DOMAIN="Telegram"
+ )
+ 
++if(DEFINED ENV{GITHUB_SHA})
++    target_compile_definitions(Telegram PRIVATE
++        SOVAGRAM_BUILD_ID="$ENV{GITHUB_SHA}")
++elseif(DEFINED SOVAGRAM_BUILD_ID)
++    target_compile_definitions(Telegram PRIVATE
++        SOVAGRAM_BUILD_ID="${SOVAGRAM_BUILD_ID}")
++endif()
++if(DEFINED SOVAGRAM_RELEASES_REPO)
++    target_compile_definitions(Telegram PRIVATE
++        SOVAGRAM_RELEASES_REPO="${SOVAGRAM_RELEASES_REPO}")
++endif()
++
+ get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+ if (APPLE
+     OR is_multi_config
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 226614677b..8aff6acf50 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -130,6 +130,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ "lng_cancel" = "Cancel";
+ "lng_continue" = "Continue";
+ "lng_close" = "Close";
++
++"lng_sovagram_update_title" = "Sovagram update available";
++"lng_sovagram_update_available" = "New Sovagram release: {tag}";
++"lng_sovagram_update_body" = "A new Sovagram release ({tag}) is available on GitHub. Open the release page to download it?";
++"lng_sovagram_update_open" = "Open release page";
+ "lng_minimize_window" = "Minimize";
+ "lng_maximize_window" = "Maximize";
+ "lng_restore_window" = "Restore";
+diff --git a/Telegram/SourceFiles/core/application.cpp b/Telegram/SourceFiles/core/application.cpp
+index de4b20765a..08b39ffd3e 100644
+--- a/Telegram/SourceFiles/core/application.cpp
++++ b/Telegram/SourceFiles/core/application.cpp
+@@ -25,6 +25,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "core/update_checker.h"
+ #include "core/shortcuts.h"
+ #include "core/sandbox.h"
++#include "core/sovagram_updater.h"
+ #include "core/local_url_handlers.h"
+ #include "core/launcher.h"
+ #include "core/ui_integration.h"
+@@ -402,6 +403,8 @@ void Application::run() {
+ 		showOpenGLCrashNotification();
+ 	}
+ 
++	Core::SovagramUpdater::StartCheck();
++
+ 	_openInMediaViewRequests.events(
+ 	) | rpl::on_next([=](Media::View::OpenRequest &&request) {
+ 		if (_mediaView) {
+diff --git a/Telegram/SourceFiles/core/sovagram_updater.cpp b/Telegram/SourceFiles/core/sovagram_updater.cpp
+new file mode 100644
+index 0000000000..1dceec4e38
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sovagram_updater.cpp
+@@ -0,0 +1,148 @@
++/*
++This file is part of Sovagram, a fork of Telegram Desktop.
++Licensed under GPLv3. See LEGAL for the original Telegram Desktop
++copyright notice and full license terms.
++*/
++#include "core/sovagram_updater.h"
++
++#include "base/call_delayed.h"
++#include "core/application.h"
++#include "core/file_utilities.h"
++#include "lang/lang_keys.h"
++#include "ui/boxes/confirm_box.h"
++#include "ui/toast/toast.h"
++#include "window/window_controller.h"
++#include "window/window_session_controller.h"
++
++#include <QtCore/QJsonArray>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtNetwork/QNetworkAccessManager>
++#include <QtNetwork/QNetworkReply>
++#include <QtNetwork/QNetworkRequest>
++
++#ifndef SOVAGRAM_BUILD_ID
++#define SOVAGRAM_BUILD_ID ""
++#endif
++
++#ifndef SOVAGRAM_RELEASES_REPO
++#define SOVAGRAM_RELEASES_REPO "melnoff/sovagram-desktop"
++#endif
++
++namespace Core::SovagramUpdater {
++namespace {
++
++constexpr auto kCheckDelay = crl::time(30 * 1000);
++
++[[nodiscard]] QString CurrentBuildId() {
++	return QString::fromLatin1(SOVAGRAM_BUILD_ID);
++}
++
++[[nodiscard]] QString ApiUrl() {
++	return QStringLiteral(
++		"https://api.github.com/repos/%1/releases/latest"
++	).arg(QStringLiteral(SOVAGRAM_RELEASES_REPO));
++}
++
++void NotifyNewVersion(const QString &tag, const QString &downloadUrl) {
++	auto toastText = tr::lng_sovagram_update_available(
++		tr::now,
++		lt_tag,
++		tag);
++	Ui::Toast::Show(toastText);
++
++	const auto window = Core::App().activeWindow();
++	if (!window) {
++		return;
++	}
++	window->show(Ui::MakeConfirmBox({
++		.text = tr::lng_sovagram_update_body(
++			tr::now,
++			lt_tag,
++			rpl::single(TextWithEntities{ tag }),
++			Ui::Text::RichLangValue),
++		.confirmed = [=](Fn<void()> close) {
++			File::OpenUrl(downloadUrl);
++			close();
++		},
++		.confirmText = tr::lng_sovagram_update_open(),
++		.cancelText = tr::lng_cancel(),
++		.title = tr::lng_sovagram_update_title(),
++	}));
++}
++
++[[nodiscard]] QString FindExeAssetUrl(const QJsonArray &assets) {
++	for (const auto &item : assets) {
++		const auto asset = item.toObject();
++		const auto name = asset.value(u"name"_q).toString();
++		if (name.startsWith(u"Sovagram"_q, Qt::CaseInsensitive)
++			&& name.endsWith(u".exe"_q, Qt::CaseInsensitive)) {
++			return asset.value(u"browser_download_url"_q).toString();
++		}
++	}
++	return QString();
++}
++
++void HandleLatestRelease(const QJsonObject &data) {
++	const auto tag = data.value(u"tag_name"_q).toString();
++	const auto releaseUrl = data.value(u"html_url"_q).toString();
++	const auto draft = data.value(u"draft"_q).toBool(false);
++	const auto prerelease = data.value(u"prerelease"_q).toBool(false);
++	if (tag.isEmpty() || releaseUrl.isEmpty() || draft || prerelease) {
++		return;
++	}
++	const auto current = CurrentBuildId();
++	if (current.isEmpty()) {
++		LOG(("SovagramUpdater: no build id, skipping check."));
++		return;
++	}
++	const auto short_current = current.left(7);
++	if (tag.contains(short_current)) {
++		LOG(("SovagramUpdater: already at latest (%1).").arg(tag));
++		return;
++	}
++	const auto exeUrl = FindExeAssetUrl(data.value(u"assets"_q).toArray());
++	const auto downloadUrl = exeUrl.isEmpty() ? releaseUrl : exeUrl;
++	LOG(("SovagramUpdater: new release %1 found, current build %2, "
++		"pointing user to %3."
++		).arg(tag, short_current, downloadUrl));
++	NotifyNewVersion(tag, downloadUrl);
++}
++
++void QueryApi() {
++	static auto manager = std::make_unique<QNetworkAccessManager>();
++	auto request = QNetworkRequest(QUrl(ApiUrl()));
++	request.setHeader(
++		QNetworkRequest::UserAgentHeader,
++		QStringLiteral("Sovagram-UpdateChecker"));
++	request.setRawHeader(
++		"Accept",
++		"application/vnd.github+json");
++	const auto reply = manager->get(request);
++	QObject::connect(reply, &QNetworkReply::finished, [=] {
++		reply->deleteLater();
++		if (reply->error() != QNetworkReply::NoError) {
++			LOG(("SovagramUpdater: network error %1"
++				).arg(reply->errorString()));
++			return;
++		}
++		const auto doc = QJsonDocument::fromJson(reply->readAll());
++		if (!doc.isObject()) {
++			return;
++		}
++		HandleLatestRelease(doc.object());
++	});
++}
++
++} // namespace
++
++void StartCheck() {
++	if (QString::fromLatin1(SOVAGRAM_BUILD_ID).isEmpty()) {
++		return;
++	}
++	base::call_delayed(kCheckDelay, [] {
++		QueryApi();
++	});
++}
++
++} // namespace Core::SovagramUpdater
+diff --git a/Telegram/SourceFiles/core/sovagram_updater.h b/Telegram/SourceFiles/core/sovagram_updater.h
+new file mode 100644
+index 0000000000..2cc9981882
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sovagram_updater.h
+@@ -0,0 +1,12 @@
++/*
++This file is part of Sovagram, a fork of Telegram Desktop.
++Licensed under GPLv3. See LEGAL for the original Telegram Desktop
++copyright notice and full license terms.
++*/
++#pragma once
++
++namespace Core::SovagramUpdater {
++
++void StartCheck();
++
++} // namespace Core::SovagramUpdater
+-- 
+2.54.0.windows.1
+
