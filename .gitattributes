@@ -1,0 +1,12 @@
+# Patches must be byte-exact across platforms; never let core.autocrlf
+# rewrite line endings, otherwise `git am` fails on Windows runners
+# because the LF-context inside the patch turns into CRLF on checkout.
+*.patch -text
+
+# Workflow YAML and shell scripts should stay LF on every platform.
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.sh       text eol=lf
+
+# All other text uses git's default normalization.
+* text=auto
