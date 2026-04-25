@@ -23,13 +23,26 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Ensure tdesktop submodule has the pinned commit
+        shell: bash
+        run: |
+          PINNED=$(git ls-tree HEAD tdesktop | awk '{print $3}')
+          echo "Pinned tdesktop SHA: $PINNED"
+          cd tdesktop
+          if ! git cat-file -e "${PINNED}^{commit}" 2>/dev/null; then
+            echo "Pinned commit not in shallow clone — deepening fetch."
+            git fetch --unshallow origin || git fetch origin
+          fi
+          git checkout --detach "$PINNED"
+          echo "Submodule HEAD now: $(git rev-parse HEAD)"
+
       - name: Apply VLESS patch (for singbox sources)
         shell: bash
         run: |
           cd tdesktop
           git config user.email "build-bot@users.noreply.github.com"
           git config user.name "build-bot"
-          git am --3way --keep-cr ../patches/01-vless/*.patch
+          git am --3way ../patches/01-vless/*.patch
 
       - uses: actions/setup-go@v5
         with:
@@ -70,6 +83,18 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Ensure tdesktop submodule has the pinned commit
+        shell: bash
+        run: |
+          PINNED=$(git ls-tree HEAD tdesktop | awk '{print $3}')
+          echo "Pinned tdesktop SHA: $PINNED"
+          cd tdesktop
+          if ! git cat-file -e "${PINNED}^{commit}" 2>/dev/null; then
+            echo "Pinned commit not in shallow clone — deepening fetch."
+            git fetch --unshallow origin || git fetch origin
+          fi
+          git checkout --detach "$PINNED"
+
       - name: Read patches config
         shell: bash
         id: patches
@@ -86,7 +111,7 @@ jobs:
           git config user.name "build-bot"
           for p in ${{ steps.patches.outputs.list }}; do
             echo "::group::Apply patches/$p"
-            git am --3way --keep-cr ../patches/$p/*.patch
+            git am --3way ../patches/$p/*.patch
             echo "::endgroup::"
           done
 
