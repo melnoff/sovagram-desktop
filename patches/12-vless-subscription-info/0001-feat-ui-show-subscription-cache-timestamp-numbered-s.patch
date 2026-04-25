@@ -1,0 +1,237 @@
+From d0aef4e3f04d627b275ea99a50b308f2a1342f95 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 22:52:00 +0300
+Subject: [PATCH] feat(ui): show subscription cache timestamp + numbered server
+ list
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 12 — small UX wins for VLESS SUB proxies, no bridge changes:
+
+  * SubscriptionCache stores fetchedAt per entry (set automatically
+    by setServers, persisted as ISO8601 in sovagram_subscriptions.json
+    under a new "fetched_at" key, parsed back on load). Old cache
+    files without the field still load — fetchedAt stays invalid.
+  * SubscriptionEntry struct + new entry(url) accessor.
+  * connection_box: extracted renderSubscriptionEntry() helper used
+    both on dialog open and after refresh. Status line now reads
+    "12 server(s) — refreshed 2026-04-25 19:21" instead of just
+    a count, and the server names list is numbered with right-
+    aligned indices for easier counting.
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 52 ++++++++++++-------
+ .../mtproto/proxy/subscription_cache.cpp      | 42 +++++++++++----
+ .../mtproto/proxy/subscription_cache.h        | 13 ++++-
+ 3 files changed, 75 insertions(+), 32 deletions(-)
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index d4701cae2d..26d19a71b2 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -434,6 +434,8 @@ private:
+ 	void syncVlessFromUrl();
+ 	void syncVlessFromFields();
+ 	void refreshSubscription();
++	void renderSubscriptionEntry(
++		const MTP::Proxy::SubscriptionEntry &entry);
+ 
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+@@ -1592,19 +1594,35 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 		st::proxyEditInputPadding + QMargins(0, 4, 0, 8));
+ 
+ 	if (data.type == Type::VlessSubscription && !data.host.isEmpty()) {
+-		const auto cached = MTP::Proxy::SubscriptionCache::instance()
+-			.servers(data.host);
+-		if (!cached.isEmpty()) {
+-			QStringList names;
+-			names.reserve(cached.size());
+-			for (const auto &p : cached) {
+-				names.append(p.name.isEmpty() ? p.server : p.name);
+-			}
+-			_subStatus->setText(QStringLiteral(
+-				"Cached: %1 server(s).").arg(cached.size()));
+-			_subServersLabel->setText(names.join(QChar(u'\n')));
+-		}
++		renderSubscriptionEntry(
++			MTP::Proxy::SubscriptionCache::instance().entry(data.host));
++	}
++}
++
++void ProxyBox::renderSubscriptionEntry(
++		const MTP::Proxy::SubscriptionEntry &entry) {
++	if (!_subStatus || !_subServersLabel) {
++		return;
++	}
++	if (entry.empty()) {
++		return;
+ 	}
++	const auto stamp = entry.fetchedAt.isValid()
++		? entry.fetchedAt.toString(u"yyyy-MM-dd HH:mm"_q)
++		: QStringLiteral("(unknown)");
++	_subStatus->setText(QStringLiteral("%1 server(s) — refreshed %2")
++		.arg(entry.servers.size())
++		.arg(stamp));
++	const auto width = QString::number(entry.servers.size()).size();
++	QStringList lines;
++	lines.reserve(entry.servers.size());
++	for (int i = 0; i != entry.servers.size(); ++i) {
++		const auto &p = entry.servers[i];
++		const auto label = p.name.isEmpty() ? p.server : p.name;
++		const auto idx = QString::number(i + 1).rightJustified(width, u' ');
++		lines.append(QStringLiteral("%1. %2").arg(idx, label));
++	}
++	_subServersLabel->setText(lines.join(QChar(u'\n')));
+ }
+ 
+ void ProxyBox::refreshSubscription() {
+@@ -1629,14 +1647,8 @@ void ProxyBox::refreshSubscription() {
+ 				url,
+ 				result.servers);
+ 			MTP::Proxy::VlessBridge::instance().stopSubscription(url);
+-			_subStatus->setText(QStringLiteral(
+-				"Loaded %1 server(s).").arg(result.servers.size()));
+-			QStringList names;
+-			names.reserve(result.servers.size());
+-			for (const auto &p : result.servers) {
+-				names.append(p.name.isEmpty() ? p.server : p.name);
+-			}
+-			_subServersLabel->setText(names.join(QChar(u'\n')));
++			renderSubscriptionEntry(
++				MTP::Proxy::SubscriptionCache::instance().entry(url));
+ 		}, lifetime());
+ 	}
+ 	_subStatus->setText(QStringLiteral("Fetching..."));
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+index db05be9c55..88f9c87a00 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+@@ -53,8 +53,8 @@ void SubscriptionCache::ensureLoaded() {
+ 	const auto subs = doc.object()
+ 		.value(u"subscriptions"_q).toObject();
+ 	for (auto it = subs.begin(); it != subs.end(); ++it) {
+-		const auto entry = it.value().toObject();
+-		const auto serversArray = entry.value(u"servers"_q).toArray();
++		const auto entryObj = it.value().toObject();
++		const auto serversArray = entryObj.value(u"servers"_q).toArray();
+ 		QList<VlessParams> servers;
+ 		servers.reserve(serversArray.size());
+ 		for (const auto &v : serversArray) {
+@@ -62,26 +62,35 @@ void SubscriptionCache::ensureLoaded() {
+ 				servers.append(std::move(*p));
+ 			}
+ 		}
+-		if (!servers.isEmpty()) {
+-			_entries.emplace(it.key(), std::move(servers));
++		if (servers.isEmpty()) {
++			continue;
+ 		}
++		SubscriptionEntry entry;
++		entry.servers = std::move(servers);
++		entry.fetchedAt = QDateTime::fromString(
++			entryObj.value(u"fetched_at"_q).toString(),
++			Qt::ISODate);
++		_entries.emplace(it.key(), std::move(entry));
+ 	}
+ }
+ 
+ void SubscriptionCache::persist() {
+ 	QJsonObject root;
+ 	QJsonObject subs;
+-	for (const auto &[url, servers] : _entries) {
++	for (const auto &[url, entry] : _entries) {
+ 		QJsonArray arr;
+-		for (const auto &p : servers) {
++		for (const auto &p : entry.servers) {
+ 			const auto built = BuildVlessUrl(p);
+ 			if (!built.isEmpty()) {
+ 				arr.append(built);
+ 			}
+ 		}
+-		QJsonObject entry;
+-		entry[u"servers"_q] = arr;
+-		subs[url] = entry;
++		QJsonObject obj;
++		obj[u"servers"_q] = arr;
++		if (entry.fetchedAt.isValid()) {
++			obj[u"fetched_at"_q] = entry.fetchedAt.toString(Qt::ISODate);
++		}
++		subs[url] = obj;
+ 	}
+ 	root[u"subscriptions"_q] = subs;
+ 
+@@ -102,7 +111,15 @@ QList<VlessParams> SubscriptionCache::servers(
+ 	QMutexLocker lock(&_mu);
+ 	ensureLoaded();
+ 	const auto it = _entries.find(subscriptionUrl);
+-	return (it == _entries.end()) ? QList<VlessParams>() : it->second;
++	return (it == _entries.end()) ? QList<VlessParams>() : it->second.servers;
++}
++
++SubscriptionEntry SubscriptionCache::entry(
++		const QString &subscriptionUrl) {
++	QMutexLocker lock(&_mu);
++	ensureLoaded();
++	const auto it = _entries.find(subscriptionUrl);
++	return (it == _entries.end()) ? SubscriptionEntry() : it->second;
+ }
+ 
+ void SubscriptionCache::setServers(
+@@ -113,7 +130,10 @@ void SubscriptionCache::setServers(
+ 	if (servers.isEmpty()) {
+ 		_entries.erase(subscriptionUrl);
+ 	} else {
+-		_entries[subscriptionUrl] = servers;
++		SubscriptionEntry entry;
++		entry.servers = servers;
++		entry.fetchedAt = QDateTime::currentDateTime();
++		_entries[subscriptionUrl] = std::move(entry);
+ 	}
+ 	persist();
+ }
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+index d52ef72151..8ef5b28095 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+@@ -10,10 +10,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "mtproto/proxy/vless_parser.h"
+ #include "base/flat_map.h"
+ 
++#include <QtCore/QDateTime>
+ #include <QtCore/QMutex>
+ 
+ namespace MTP::Proxy {
+ 
++struct SubscriptionEntry {
++	QList<VlessParams> servers;
++	QDateTime fetchedAt;
++
++	[[nodiscard]] bool empty() const { return servers.isEmpty(); }
++};
++
+ // In-memory + disk-backed cache of fetched VLESS subscription server lists,
+ // keyed by the user-visible subscription URL (happ:// or https://).
+ //
+@@ -29,6 +37,9 @@ public:
+ 	[[nodiscard]] QList<VlessParams> servers(
+ 		const QString &subscriptionUrl);
+ 
++	[[nodiscard]] SubscriptionEntry entry(
++		const QString &subscriptionUrl);
++
+ 	void setServers(
+ 		const QString &subscriptionUrl,
+ 		const QList<VlessParams> &servers);
+@@ -48,7 +59,7 @@ private:
+ 
+ 	QMutex _mu;
+ 	bool _loaded = false;
+-	base::flat_map<QString, QList<VlessParams>> _entries;
++	base::flat_map<QString, SubscriptionEntry> _entries;
+ };
+ 
+ } // namespace MTP::Proxy
+-- 
+2.54.0.windows.1
+

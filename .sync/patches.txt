@@ -16,3 +16,5 @@
 09-vless-subscription-fetcher
 10-vless-subscription-bridge
 11-vless-subscription-ui-wire
+12-vless-subscription-info
+13-vless-clash-api-monitor

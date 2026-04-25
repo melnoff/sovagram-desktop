@@ -1,0 +1,629 @@
+From 70ae333077848bc959e75047b5fb1650f37d3393 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 22:58:09 +0300
+Subject: [PATCH] feat(net): Clash API monitoring of subscription urltest
+ selector
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 13 — surfaces which server in a VLESS subscription is currently
+active and the last delay measurement for every server. Builds on
+patch 12.
+
+  * bridge.go: subscription sidecars now allocate a dedicated
+    Clash API port + secret and embed
+    experimental.clash_api.external_controller in the config.
+    Single-server SingboxStart stays unchanged (no urltest, no
+    selector to query). New exports SingboxGetClashPort and
+    SingboxGetClashSecret. instance struct gets clashPort/clashSecret
+    fields collected on start.
+  * VlessBridge: Running gains clashPort+clashSecret, resolved by
+    startAndCollect via the new exports. New public method
+    clashEndpointForSubscription(key) returns {endpoint, secret} or
+    nullopt when no sidecar is up.
+  * SubscriptionMonitor (new) — small QObject that polls
+    GET http://<endpoint>/proxies every 3 seconds with the bearer
+    secret, parses sing-box's Clash response, picks the urltest
+    selector tagged "proxy", and emits an rpl event with the
+    currently active outbound tag plus per-server delay (-1 = unknown
+    or timeout). Owned per ProxyBox dialog, started/stopped with it.
+  * connection_box: when a Type::VlessSubscription dialog opens and
+    the corresponding sidecar happens to be running, spin up the
+    monitor. Header now also says "active: vN" or "monitor: <error>",
+    and each server line is rendered as "→ 1. server-de  45ms" for
+    the active one or "  2. server-nl  60ms" / "timeout" for the
+    rest. Refresh resets the monitor (sidecar gets restarted on next
+    use).
+---
+ Telegram/CMakeLists.txt                       |   2 +
+ Telegram/SourceFiles/boxes/connection_box.cpp |  67 +++++++++-
+ .../mtproto/proxy/subscription_monitor.cpp    | 121 ++++++++++++++++++
+ .../mtproto/proxy/subscription_monitor.h      |  59 +++++++++
+ .../mtproto/proxy/vless_bridge.cpp            |  42 ++++--
+ .../SourceFiles/mtproto/proxy/vless_bridge.h  |  30 +++--
+ Telegram/ThirdParty/singbox_bridge/bridge.go  |  69 ++++++++--
+ 7 files changed, 355 insertions(+), 35 deletions(-)
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 3674ad6e69..36312bf45e 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -1445,6 +1445,8 @@ PRIVATE
+     mtproto/session_private.h
+     mtproto/proxy/subscription_fetcher.cpp
+     mtproto/proxy/subscription_fetcher.h
++    mtproto/proxy/subscription_monitor.cpp
++    mtproto/proxy/subscription_monitor.h
+     mtproto/special_config_request.cpp
+     mtproto/special_config_request.h
+     mtproto/type_utils.h
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index 26d19a71b2..4dba9198ab 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -18,6 +18,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "main/main_account.h"
+ #include "mtproto/proxy/subscription_cache.h"
+ #include "mtproto/proxy/subscription_fetcher.h"
++#include "mtproto/proxy/subscription_monitor.h"
+ #include "mtproto/proxy/vless_bridge.h"
+ #include "mtproto/proxy/vless_parser.h"
+ #include "main/main_session.h"
+@@ -436,6 +437,7 @@ private:
+ 	void refreshSubscription();
+ 	void renderSubscriptionEntry(
+ 		const MTP::Proxy::SubscriptionEntry &entry);
++	void startSubscriptionMonitorIfRunning(const QString &subscriptionUrl);
+ 
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+@@ -484,6 +486,9 @@ private:
+ 	QPointer<Ui::FlatLabel> _subStatus;
+ 	QPointer<Ui::FlatLabel> _subServersLabel;
+ 	std::unique_ptr<MTP::Proxy::SubscriptionFetcher> _subFetcher;
++	std::unique_ptr<MTP::Proxy::SubscriptionMonitor> _subMonitor;
++	MTP::Proxy::SubscriptionMonitorStatus _subMonitorStatus;
++	MTP::Proxy::SubscriptionEntry _subEntry;
+ 
+ };
+ 
+@@ -1594,8 +1599,10 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 		st::proxyEditInputPadding + QMargins(0, 4, 0, 8));
+ 
+ 	if (data.type == Type::VlessSubscription && !data.host.isEmpty()) {
+-		renderSubscriptionEntry(
+-			MTP::Proxy::SubscriptionCache::instance().entry(data.host));
++		_subEntry = MTP::Proxy::SubscriptionCache::instance()
++			.entry(data.host);
++		renderSubscriptionEntry(_subEntry);
++		startSubscriptionMonitorIfRunning(data.host);
+ 	}
+ }
+ 
+@@ -1610,9 +1617,22 @@ void ProxyBox::renderSubscriptionEntry(
+ 	const auto stamp = entry.fetchedAt.isValid()
+ 		? entry.fetchedAt.toString(u"yyyy-MM-dd HH:mm"_q)
+ 		: QStringLiteral("(unknown)");
+-	_subStatus->setText(QStringLiteral("%1 server(s) — refreshed %2")
++	auto header = QStringLiteral("%1 server(s) — refreshed %2")
+ 		.arg(entry.servers.size())
+-		.arg(stamp));
++		.arg(stamp);
++	if (!_subMonitorStatus.error.isEmpty()) {
++		header += QStringLiteral(" · monitor: ") + _subMonitorStatus.error;
++	} else if (!_subMonitorStatus.activeTag.isEmpty()) {
++		header += QStringLiteral(" · active: ")
++			+ _subMonitorStatus.activeTag;
++	}
++	_subStatus->setText(header);
++
++	QHash<QString, int> delayByTag;
++	for (const auto &s : _subMonitorStatus.servers) {
++		delayByTag.insert(s.tag, s.delayMs);
++	}
++
+ 	const auto width = QString::number(entry.servers.size()).size();
+ 	QStringList lines;
+ 	lines.reserve(entry.servers.size());
+@@ -1620,11 +1640,41 @@ void ProxyBox::renderSubscriptionEntry(
+ 		const auto &p = entry.servers[i];
+ 		const auto label = p.name.isEmpty() ? p.server : p.name;
+ 		const auto idx = QString::number(i + 1).rightJustified(width, u' ');
+-		lines.append(QStringLiteral("%1. %2").arg(idx, label));
++		const auto tag = QStringLiteral("v%1").arg(i);
++		const auto active = (_subMonitorStatus.activeTag == tag);
++		auto line = QStringLiteral("%1 %2. %3")
++			.arg(active ? u"→"_q : u" "_q)
++			.arg(idx, label);
++		const auto it = delayByTag.find(tag);
++		if (it != delayByTag.end() && it.value() >= 0) {
++			line += QStringLiteral("  %1ms").arg(it.value());
++		} else if (it != delayByTag.end()) {
++			line += QStringLiteral("  timeout");
++		}
++		lines.append(line);
+ 	}
+ 	_subServersLabel->setText(lines.join(QChar(u'\n')));
+ }
+ 
++void ProxyBox::startSubscriptionMonitorIfRunning(
++		const QString &subscriptionUrl) {
++	const auto endpoint = MTP::Proxy::VlessBridge::instance()
++		.clashEndpointForSubscription(subscriptionUrl);
++	if (!endpoint) {
++		_subMonitor.reset();
++		return;
++	}
++	_subMonitor = std::make_unique<MTP::Proxy::SubscriptionMonitor>(
++		endpoint->endpoint,
++		endpoint->secret);
++	_subMonitor->status(
++	) | rpl::on_next([=](MTP::Proxy::SubscriptionMonitorStatus status) {
++		_subMonitorStatus = std::move(status);
++		renderSubscriptionEntry(_subEntry);
++	}, lifetime());
++	_subMonitor->start();
++}
++
+ void ProxyBox::refreshSubscription() {
+ 	if (!_subUrl || !_subStatus || !_subServersLabel) {
+ 		return;
+@@ -1647,8 +1697,11 @@ void ProxyBox::refreshSubscription() {
+ 				url,
+ 				result.servers);
+ 			MTP::Proxy::VlessBridge::instance().stopSubscription(url);
+-			renderSubscriptionEntry(
+-				MTP::Proxy::SubscriptionCache::instance().entry(url));
++			_subMonitor.reset();
++			_subMonitorStatus = {};
++			_subEntry = MTP::Proxy::SubscriptionCache::instance()
++				.entry(url);
++			renderSubscriptionEntry(_subEntry);
+ 		}, lifetime());
+ 	}
+ 	_subStatus->setText(QStringLiteral("Fetching..."));
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
+new file mode 100644
+index 0000000000..e34f4fb352
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
+@@ -0,0 +1,121 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "mtproto/proxy/subscription_monitor.h"
++
++#include "logs.h"
++
++#include <QtCore/QJsonArray>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QUrl>
++#include <QtNetwork/QNetworkReply>
++#include <QtNetwork/QNetworkRequest>
++
++namespace MTP::Proxy {
++namespace {
++
++constexpr auto kPollInterval = 3000;
++constexpr auto kRequestTimeout = 2500;
++
++} // namespace
++
++SubscriptionMonitor::SubscriptionMonitor(
++	const QString &endpoint,
++	const QString &secret,
++	QObject *parent)
++: QObject(parent)
++, _endpoint(endpoint)
++, _secret(secret) {
++	_timer.setInterval(kPollInterval);
++	QObject::connect(&_timer, &QTimer::timeout, this, [=] { poll(); });
++}
++
++SubscriptionMonitor::~SubscriptionMonitor() {
++	stop();
++}
++
++void SubscriptionMonitor::start() {
++	if (_timer.isActive()) {
++		return;
++	}
++	_timer.start();
++	poll();
++}
++
++void SubscriptionMonitor::stop() {
++	_timer.stop();
++	if (_current) {
++		_current->disconnect(this);
++		_current->abort();
++		_current->deleteLater();
++		_current = nullptr;
++	}
++}
++
++void SubscriptionMonitor::poll() {
++	if (_current) {
++		return;
++	}
++	const auto url = QUrl(QStringLiteral("http://%1/proxies").arg(_endpoint));
++	auto request = QNetworkRequest(url);
++	request.setRawHeader(
++		"Authorization",
++		"Bearer " + _secret.toUtf8());
++	request.setTransferTimeout(kRequestTimeout);
++	const auto reply = _net.get(request);
++	_current = reply;
++	QObject::connect(reply, &QNetworkReply::finished, this, [=] {
++		handleReply(reply);
++	});
++}
++
++void SubscriptionMonitor::handleReply(QNetworkReply *reply) {
++	reply->deleteLater();
++	if (reply != _current) {
++		return;
++	}
++	_current = nullptr;
++
++	if (reply->error() != QNetworkReply::NoError) {
++		_status.fire({ {}, reply->errorString(), {} });
++		return;
++	}
++	const auto doc = QJsonDocument::fromJson(reply->readAll());
++	if (!doc.isObject()) {
++		_status.fire({ {}, QStringLiteral("Bad Clash API response."), {} });
++		return;
++	}
++	const auto proxies = doc.object().value(u"proxies"_q).toObject();
++	const auto selector = proxies.value(u"proxy"_q).toObject();
++	const auto activeTag = selector.value(u"now"_q).toString();
++	const auto allTags = selector.value(u"all"_q).toArray();
++
++	QList<SubscriptionServerStatus> servers;
++	servers.reserve(allTags.size());
++	for (const auto &t : allTags) {
++		const auto tag = t.toString();
++		if (tag.isEmpty()) {
++			continue;
++		}
++		const auto entry = proxies.value(tag).toObject();
++		const auto history = entry.value(u"history"_q).toArray();
++		auto delayMs = -1;
++		if (!history.isEmpty()) {
++			const auto last = history.last().toObject();
++			delayMs = last.value(u"delay"_q).toInt(-1);
++		}
++		servers.append({ tag, delayMs });
++	}
++	_status.fire({ activeTag, QString(), std::move(servers) });
++}
++
++rpl::producer<SubscriptionMonitorStatus> SubscriptionMonitor::status() {
++	return _status.events();
++}
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
+new file mode 100644
+index 0000000000..bcc85723f8
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
+@@ -0,0 +1,59 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <QtCore/QObject>
++#include <QtCore/QPointer>
++#include <QtCore/QTimer>
++#include <QtNetwork/QNetworkAccessManager>
++
++class QNetworkReply;
++
++namespace MTP::Proxy {
++
++struct SubscriptionServerStatus {
++	QString tag;       // sing-box outbound tag, e.g. "v0"
++	int delayMs = -1;  // last measured delay; -1 if unknown / timeout
++};
++
++struct SubscriptionMonitorStatus {
++	QString activeTag;                       // currently selected by urltest
++	QString error;                           // empty on success
++	QList<SubscriptionServerStatus> servers; // one entry per "vN" tag
++};
++
++// Polls a sing-box Clash API endpoint every few seconds and emits which
++// outbound the urltest selector currently considers active plus the last
++// delay measurement for every server in the subscription. Owned per
++// edit-dialog instance — destroying the monitor stops the timer.
++class SubscriptionMonitor final : public QObject {
++public:
++	SubscriptionMonitor(
++		const QString &endpoint,
++		const QString &secret,
++		QObject *parent = nullptr);
++	~SubscriptionMonitor();
++
++	void start();
++	void stop();
++
++	[[nodiscard]] rpl::producer<SubscriptionMonitorStatus> status();
++
++private:
++	void poll();
++	void handleReply(QNetworkReply *reply);
++
++	QString _endpoint;
++	QString _secret;
++	QTimer _timer;
++	QNetworkAccessManager _net;
++	QPointer<QNetworkReply> _current;
++	rpl::event_stream<SubscriptionMonitorStatus> _status;
++};
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+index 97a6d1c862..e986edd211 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+@@ -60,16 +60,19 @@ bool VlessBridge::ensureLoaded() {
+ 		_lib.reset();
+ 		return false;
+ 	}
+-	_start      = (int  (*)(const char*)) _lib->resolve("SingboxStart");
+-	_startSub   = (int  (*)(const char*)) _lib->resolve("SingboxStartSubscription");
+-	_stop       = (int  (*)(int))         _lib->resolve("SingboxStop");
+-	_getPort    = (int  (*)(int))         _lib->resolve("SingboxGetPort");
+-	_getUser    = (char*(*)(int))         _lib->resolve("SingboxGetUser");
+-	_getPass    = (char*(*)(int))         _lib->resolve("SingboxGetPass");
+-	_lastError  = (char*(*)())            _lib->resolve("SingboxLastError");
+-	_freeString = (void (*)(char*))       _lib->resolve("SingboxFreeString");
+-	if (!_start || !_startSub || !_stop || !_getPort || !_getUser
+-			|| !_getPass || !_lastError || !_freeString) {
++	_start          = (int  (*)(const char*)) _lib->resolve("SingboxStart");
++	_startSub       = (int  (*)(const char*)) _lib->resolve("SingboxStartSubscription");
++	_stop           = (int  (*)(int))         _lib->resolve("SingboxStop");
++	_getPort        = (int  (*)(int))         _lib->resolve("SingboxGetPort");
++	_getUser        = (char*(*)(int))         _lib->resolve("SingboxGetUser");
++	_getPass        = (char*(*)(int))         _lib->resolve("SingboxGetPass");
++	_getClashPort   = (int  (*)(int))         _lib->resolve("SingboxGetClashPort");
++	_getClashSecret = (char*(*)(int))         _lib->resolve("SingboxGetClashSecret");
++	_lastError      = (char*(*)())            _lib->resolve("SingboxLastError");
++	_freeString     = (void (*)(char*))       _lib->resolve("SingboxFreeString");
++	if (!_start || !_startSub || !_stop || !_getPort || !_getUser || !_getPass
++			|| !_getClashPort || !_getClashSecret
++			|| !_lastError || !_freeString) {
+ 		LOG(("VLESS: singbox dll missing exports"));
+ 		_lib->unload();
+ 		_lib.reset();
+@@ -98,9 +101,28 @@ std::optional<VlessBridge::Running> VlessBridge::startAndCollect(int id) {
+ 	r.pass = QString::fromUtf8(p ? p : "");
+ 	if (u) _freeString(u);
+ 	if (p) _freeString(p);
++	r.clashPort = quint16(_getClashPort(id));
++	if (r.clashPort != 0) {
++		char *s = _getClashSecret(id);
++		r.clashSecret = QString::fromUtf8(s ? s : "");
++		if (s) _freeString(s);
++	}
+ 	return r;
+ }
+ 
++std::optional<VlessBridge::ClashEndpoint>
++VlessBridge::clashEndpointForSubscription(const QString &subscriptionKey) {
++	QMutexLocker lock(&_mu);
++	const auto it = _runningSubscriptions.find(subscriptionKey);
++	if (it == _runningSubscriptions.end() || it->second.clashPort == 0) {
++		return std::nullopt;
++	}
++	return ClashEndpoint{
++		.endpoint = QStringLiteral("127.0.0.1:%1").arg(it->second.clashPort),
++		.secret = it->second.clashSecret,
++	};
++}
++
+ ProxyData VlessBridge::ensureRunning(const ProxyData &vlessProxy) {
+ 	Expects(vlessProxy.type == ProxyData::Type::Vless);
+ 
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+index 370976e608..83c55afc1f 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+@@ -47,6 +47,16 @@ public:
+ 	// Stop all instances and unload the DLL. Call on app shutdown.
+ 	void shutdownAll();
+ 
++	struct ClashEndpoint {
++		QString endpoint; // "127.0.0.1:port"
++		QString secret;
++	};
++
++	// Returns the Clash API endpoint + secret for a running subscription
++	// sidecar, or std::nullopt if no sidecar is running for this key.
++	[[nodiscard]] std::optional<ClashEndpoint> clashEndpointForSubscription(
++		const QString &subscriptionKey);
++
+ private:
+ 	VlessBridge();
+ 	~VlessBridge();
+@@ -60,6 +70,8 @@ private:
+ 		quint16 port = 0;
+ 		QString user;
+ 		QString pass;
++		quint16 clashPort = 0;
++		QString clashSecret;
+ 	};
+ 
+ 	[[nodiscard]] std::optional<Running> startAndCollect(int id);
+@@ -68,14 +80,16 @@ private:
+ 	std::unique_ptr<QLibrary> _lib;
+ 
+ 	// Function pointers into singbox.dll
+-	int   (*_start)(const char*) = nullptr;
+-	int   (*_startSub)(const char*) = nullptr;
+-	int   (*_stop)(int)          = nullptr;
+-	int   (*_getPort)(int)       = nullptr;
+-	char* (*_getUser)(int)       = nullptr;
+-	char* (*_getPass)(int)       = nullptr;
+-	char* (*_lastError)()        = nullptr;
+-	void  (*_freeString)(char*)  = nullptr;
++	int   (*_start)(const char*)       = nullptr;
++	int   (*_startSub)(const char*)    = nullptr;
++	int   (*_stop)(int)                = nullptr;
++	int   (*_getPort)(int)             = nullptr;
++	char* (*_getUser)(int)             = nullptr;
++	char* (*_getPass)(int)             = nullptr;
++	int   (*_getClashPort)(int)        = nullptr;
++	char* (*_getClashSecret)(int)      = nullptr;
++	char* (*_lastError)()              = nullptr;
++	void  (*_freeString)(char*)        = nullptr;
+ 
+ 	base::flat_map<QString, Running> _running;
+ 	base::flat_map<QString, Running> _runningSubscriptions;
+diff --git a/Telegram/ThirdParty/singbox_bridge/bridge.go b/Telegram/ThirdParty/singbox_bridge/bridge.go
+index b067013dd8..e927e02df3 100644
+--- a/Telegram/ThirdParty/singbox_bridge/bridge.go
++++ b/Telegram/ThirdParty/singbox_bridge/bridge.go
+@@ -23,10 +23,12 @@ import (
+ )
+ 
+ type instance struct {
+-	box  *box.Box
+-	port int
+-	user string
+-	pass string
++	box         *box.Box
++	port        int
++	user        string
++	pass        string
++	clashPort   int
++	clashSecret string
+ }
+ 
+ var (
+@@ -58,7 +60,7 @@ func pickFreePort() (int, error) {
+ 	return port, nil
+ }
+ 
+-func startBoxWithOutbounds(outboundsArrayJSON string) C.int {
++func startBoxWithOutbounds(outboundsArrayJSON string, withClashAPI bool) C.int {
+ 	port, err := pickFreePort()
+ 	if err != nil {
+ 		setErr(fmt.Errorf("pick port: %w", err))
+@@ -68,6 +70,26 @@ func startBoxWithOutbounds(outboundsArrayJSON string) C.int {
+ 	user := uuid.NewString()
+ 	pass := uuid.NewString()
+ 
++	clashSection := ""
++	clashPort := 0
++	clashSecret := ""
++	if withClashAPI {
++		cp, err := pickFreePort()
++		if err != nil {
++			setErr(fmt.Errorf("pick clash port: %w", err))
++			return 0
++		}
++		clashPort = cp
++		clashSecret = uuid.NewString()
++		clashSection = fmt.Sprintf(`,
++  "experimental": {
++    "clash_api": {
++      "external_controller": "127.0.0.1:%d",
++      "secret": %q
++    }
++  }`, clashPort, clashSecret)
++	}
++
+ 	full := fmt.Sprintf(`{
+   "log": {"level": "warn", "timestamp": false},
+   "inbounds": [{
+@@ -78,8 +100,8 @@ func startBoxWithOutbounds(outboundsArrayJSON string) C.int {
+     "users": [{"username": %q, "password": %q}]
+   }],
+   "outbounds": %s,
+-  "route": {"final": "proxy"}
+-}`, port, user, pass, outboundsArrayJSON)
++  "route": {"final": "proxy"}%s
++}`, port, user, pass, outboundsArrayJSON, clashSection)
+ 
+ 	ctx := include.Context(context.Background())
+ 
+@@ -105,7 +127,14 @@ func startBoxWithOutbounds(outboundsArrayJSON string) C.int {
+ 
+ 	id := atomic.AddInt32(&nextID, 1)
+ 	mu.Lock()
+-	instances[id] = &instance{box: b, port: port, user: user, pass: pass}
++	instances[id] = &instance{
++		box:         b,
++		port:        port,
++		user:        user,
++		pass:        pass,
++		clashPort:   clashPort,
++		clashSecret: clashSecret,
++	}
+ 	mu.Unlock()
+ 	return C.int(id)
+ }
+@@ -121,7 +150,7 @@ func SingboxStart(outboundJSON *C.char) C.int {
+ 	}
+ 
+ 	outbounds := "[" + outStr + `,{"type":"direct","tag":"direct"}]`
+-	return startBoxWithOutbounds(outbounds)
++	return startBoxWithOutbounds(outbounds, false)
+ }
+ 
+ //export SingboxStartSubscription
+@@ -141,7 +170,7 @@ func SingboxStartSubscription(outboundsArrayJSON *C.char) C.int {
+ 	} else {
+ 		outbounds = "[" + inner + `,{"type":"direct","tag":"direct"}]`
+ 	}
+-	return startBoxWithOutbounds(outbounds)
++	return startBoxWithOutbounds(outbounds, true)
+ }
+ 
+ //export SingboxStop
+@@ -189,6 +218,26 @@ func SingboxGetPass(id C.int) *C.char {
+ 	return C.CString("")
+ }
+ 
++//export SingboxGetClashPort
++func SingboxGetClashPort(id C.int) C.int {
++	mu.Lock()
++	defer mu.Unlock()
++	if inst, ok := instances[int32(id)]; ok {
++		return C.int(inst.clashPort)
++	}
++	return 0
++}
++
++//export SingboxGetClashSecret
++func SingboxGetClashSecret(id C.int) *C.char {
++	mu.Lock()
++	defer mu.Unlock()
++	if inst, ok := instances[int32(id)]; ok {
++		return C.CString(inst.clashSecret)
++	}
++	return C.CString("")
++}
++
+ //export SingboxLastError
+ func SingboxLastError() *C.char {
+ 	errMu.Lock()
+-- 
+2.54.0.windows.1
+
