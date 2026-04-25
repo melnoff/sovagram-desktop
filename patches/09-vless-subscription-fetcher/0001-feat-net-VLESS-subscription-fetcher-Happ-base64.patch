@@ -1,0 +1,499 @@
+From 44bb1bb5c37de7bc87fecb051175ed2dbea6006c Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 16:36:30 +0300
+Subject: [PATCH] feat(net): VLESS subscription fetcher (Happ:// + base64)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the Phase 2B foundation needed to load servers from a VLESS
+subscription:
+
+  * SubscriptionFetcher (QNetworkAccessManager) — accepts a Happ://
+    or direct https:// URL, fetches the body, tries plain-text first
+    then base64 decode, extracts vless:// lines via ParseVlessUrl,
+    emits the resulting QList<VlessParams> over an rpl producer.
+  * ResolveSubscriptionUrl() — translates "happ://add/<URL>" or
+    "happ://add/<base64-URL>" into the underlying https:// endpoint.
+  * BuildSingboxSubscriptionOutboundsJson() — produces the outbounds
+    array for sing-box: each subscription server as a "vN" outbound
+    plus a "proxy"-tagged urltest selector that picks the fastest.
+    The route.final="proxy" wrapper in bridge.go keeps working, so
+    a subscription proxy resolves to a single Socks5 with sing-box
+    doing internal failover/switching.
+  * Minor refactor of vless_parser: BuildSingboxOutboundJson now
+    delegates to a private BuildVlessOutboundObject helper that
+    takes a custom tag, used by both the single-server and the
+    subscription path.
+
+No UI / bridge / persistence wiring yet — those land in patches 10
+and 11.
+---
+ Telegram/CMakeLists.txt                       |   2 +
+ .../mtproto/proxy/subscription_fetcher.cpp    | 164 +++++++++++++++
+ .../mtproto/proxy/subscription_fetcher.h      |  46 +++++
+ .../mtproto/proxy/vless_parser.cpp            | 187 ++++++++++--------
+ .../SourceFiles/mtproto/proxy/vless_parser.h  |   2 +
+ 5 files changed, 321 insertions(+), 80 deletions(-)
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.cpp
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.h
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 5dcf134f38..3674ad6e69 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -1443,6 +1443,8 @@ PRIVATE
+     mtproto/session.h
+     mtproto/session_private.cpp
+     mtproto/session_private.h
++    mtproto/proxy/subscription_fetcher.cpp
++    mtproto/proxy/subscription_fetcher.h
+     mtproto/special_config_request.cpp
+     mtproto/special_config_request.h
+     mtproto/type_utils.h
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.cpp
+new file mode 100644
+index 0000000000..d45f56c8f6
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.cpp
+@@ -0,0 +1,164 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "mtproto/proxy/subscription_fetcher.h"
++
++#include "logs.h"
++
++#include <QtCore/QByteArray>
++#include <QtCore/QString>
++#include <QtCore/QUrl>
++#include <QtNetwork/QNetworkReply>
++#include <QtNetwork/QNetworkRequest>
++
++namespace MTP::Proxy {
++namespace {
++
++[[nodiscard]] QString TryBase64DecodeUrl(const QString &maybeBase64) {
++	const auto bytes = QByteArray::fromBase64(
++		maybeBase64.toLatin1(),
++		QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
++	if (bytes.isEmpty()) {
++		return QString();
++	}
++	const auto decoded = QString::fromUtf8(bytes).trimmed();
++	if (decoded.startsWith(u"http://"_q, Qt::CaseInsensitive)
++			|| decoded.startsWith(u"https://"_q, Qt::CaseInsensitive)) {
++		return decoded;
++	}
++	return QString();
++}
++
++[[nodiscard]] QList<VlessParams> ExtractVlessLines(const QString &text) {
++	QList<VlessParams> result;
++	const auto lines = text.split(QChar(u'\n'), Qt::SkipEmptyParts);
++	result.reserve(lines.size());
++	for (const auto &line : lines) {
++		const auto trimmed = line.trimmed();
++		if (!trimmed.startsWith(u"vless://"_q, Qt::CaseInsensitive)) {
++			continue;
++		}
++		if (auto parsed = ParseVlessUrl(trimmed)) {
++			result.append(std::move(*parsed));
++		}
++	}
++	return result;
++}
++
++} // namespace
++
++QString ResolveSubscriptionUrl(const QString &input) {
++	const auto trimmed = input.trimmed();
++	if (trimmed.isEmpty()) {
++		return QString();
++	}
++
++	if (trimmed.startsWith(u"http://"_q, Qt::CaseInsensitive)
++			|| trimmed.startsWith(u"https://"_q, Qt::CaseInsensitive)) {
++		return trimmed;
++	}
++
++	if (!trimmed.startsWith(u"happ://"_q, Qt::CaseInsensitive)) {
++		return QString();
++	}
++
++	const auto rest = trimmed.mid(QStringLiteral("happ://").size());
++	const auto slash = rest.indexOf(QChar(u'/'));
++	const auto payload = (slash < 0)
++		? QString()
++		: rest.mid(slash + 1).trimmed();
++	if (payload.isEmpty()) {
++		return QString();
++	}
++
++	if (payload.startsWith(u"http://"_q, Qt::CaseInsensitive)
++			|| payload.startsWith(u"https://"_q, Qt::CaseInsensitive)) {
++		return payload;
++	}
++	return TryBase64DecodeUrl(payload);
++}
++
++QList<VlessParams> ParseSubscriptionBody(const QByteArray &body) {
++	const auto raw = QString::fromUtf8(body);
++	const auto direct = ExtractVlessLines(raw);
++	if (!direct.isEmpty()) {
++		return direct;
++	}
++	const auto decoded = QByteArray::fromBase64(
++		body,
++		QByteArray::Base64Encoding | QByteArray::OmitTrailingEquals);
++	if (decoded.isEmpty()) {
++		return {};
++	}
++	return ExtractVlessLines(QString::fromUtf8(decoded));
++}
++
++SubscriptionFetcher::SubscriptionFetcher(QObject *parent)
++: QObject(parent) {
++}
++
++SubscriptionFetcher::~SubscriptionFetcher() {
++	cancel();
++}
++
++void SubscriptionFetcher::cancel() {
++	if (!_current) {
++		return;
++	}
++	_current->disconnect(this);
++	_current->abort();
++	_current->deleteLater();
++	_current = nullptr;
++}
++
++void SubscriptionFetcher::fetch(const QString &subscriptionUrl) {
++	cancel();
++	const auto resolved = ResolveSubscriptionUrl(subscriptionUrl);
++	if (resolved.isEmpty()) {
++		_done.fire({ {}, QStringLiteral("Invalid subscription URL.") });
++		return;
++	}
++	auto request = QNetworkRequest(QUrl(resolved));
++	request.setHeader(
++		QNetworkRequest::UserAgentHeader,
++		QStringLiteral("Sovagram-Subscription/1.0"));
++	request.setAttribute(
++		QNetworkRequest::RedirectPolicyAttribute,
++		QNetworkRequest::NoLessSafeRedirectPolicy);
++	const auto reply = _manager.get(request);
++	_current = reply;
++	QObject::connect(reply, &QNetworkReply::finished, this, [=] {
++		handleReply(reply);
++	});
++}
++
++void SubscriptionFetcher::handleReply(QNetworkReply *reply) {
++	reply->deleteLater();
++	if (reply != _current) {
++		return;
++	}
++	_current = nullptr;
++	if (reply->error() != QNetworkReply::NoError) {
++		LOG(("Subscription: fetch failed: %1").arg(reply->errorString()));
++		_done.fire({ {}, reply->errorString() });
++		return;
++	}
++	const auto body = reply->readAll();
++	auto servers = ParseSubscriptionBody(body);
++	if (servers.isEmpty()) {
++		_done.fire({ {}, QStringLiteral(
++			"No vless:// servers found in subscription.") });
++		return;
++	}
++	_done.fire({ std::move(servers), QString() });
++}
++
++rpl::producer<SubscriptionResult> SubscriptionFetcher::done() {
++	return _done.events();
++}
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.h b/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.h
+new file mode 100644
+index 0000000000..1894e9625a
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_fetcher.h
+@@ -0,0 +1,46 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include "mtproto/proxy/vless_parser.h"
++
++#include <QtCore/QObject>
++#include <QtCore/QPointer>
++#include <QtNetwork/QNetworkAccessManager>
++
++class QNetworkReply;
++
++namespace MTP::Proxy {
++
++struct SubscriptionResult {
++	QList<VlessParams> servers;
++	QString error;
++};
++
++class SubscriptionFetcher final : public QObject {
++public:
++	explicit SubscriptionFetcher(QObject *parent = nullptr);
++	~SubscriptionFetcher();
++
++	void fetch(const QString &subscriptionUrl);
++	void cancel();
++
++	[[nodiscard]] rpl::producer<SubscriptionResult> done();
++
++private:
++	void handleReply(QNetworkReply *reply);
++
++	QNetworkAccessManager _manager;
++	QPointer<QNetworkReply> _current;
++	rpl::event_stream<SubscriptionResult> _done;
++};
++
++[[nodiscard]] QString ResolveSubscriptionUrl(const QString &input);
++[[nodiscard]] QList<VlessParams> ParseSubscriptionBody(const QByteArray &body);
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp b/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
+index 248c61ff85..5358d3b29e 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
+@@ -14,6 +14,90 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include <QtCore/QUrlQuery>
+ 
+ namespace MTP::Proxy {
++namespace {
++
++[[nodiscard]] QJsonObject BuildVlessOutboundObject(
++		const VlessParams &p,
++		const QString &tag) {
++	QJsonObject o;
++	o[u"type"_q]        = u"vless"_q;
++	o[u"tag"_q]         = tag;
++	o[u"server"_q]      = p.server;
++	o[u"server_port"_q] = int(p.port);
++	o[u"uuid"_q]        = p.uuid;
++	if (!p.flow.isEmpty()) {
++		o[u"flow"_q] = p.flow;
++	}
++
++	if (p.security == u"tls"_q || p.security == u"reality"_q) {
++		QJsonObject tls;
++		tls[u"enabled"_q] = true;
++		tls[u"server_name"_q] = p.sni.isEmpty() ? p.server : p.sni;
++		if (p.allowInsecure) {
++			tls[u"insecure"_q] = true;
++		}
++		if (!p.alpn.isEmpty()) {
++			QJsonArray alpnArr;
++			for (const auto &a : p.alpn) alpnArr.append(a);
++			tls[u"alpn"_q] = alpnArr;
++		}
++		if (!p.fingerprint.isEmpty()) {
++			QJsonObject utls;
++			utls[u"enabled"_q] = true;
++			utls[u"fingerprint"_q] = p.fingerprint;
++			tls[u"utls"_q] = utls;
++		}
++		if (p.security == u"reality"_q && !p.publicKey.isEmpty()) {
++			QJsonObject reality;
++			reality[u"enabled"_q] = true;
++			reality[u"public_key"_q] = p.publicKey;
++			if (!p.shortId.isEmpty()) {
++				reality[u"short_id"_q] = p.shortId;
++			}
++			tls[u"reality"_q] = reality;
++		}
++		o[u"tls"_q] = tls;
++	}
++
++	const auto t = p.transport;
++	const auto isHttpOverTcp = (t == u"tcp"_q && p.headerType == u"http"_q);
++	if (t != u"tcp"_q || isHttpOverTcp) {
++		QJsonObject tr;
++		if (t == u"ws"_q) {
++			tr[u"type"_q] = u"ws"_q;
++			if (!p.path.isEmpty()) tr[u"path"_q] = p.path;
++			if (!p.host.isEmpty()) {
++				QJsonObject h; h[u"Host"_q] = p.host;
++				tr[u"headers"_q] = h;
++			}
++		} else if (t == u"httpupgrade"_q) {
++			tr[u"type"_q] = u"httpupgrade"_q;
++			if (!p.path.isEmpty()) tr[u"path"_q] = p.path;
++			if (!p.host.isEmpty()) tr[u"host"_q] = p.host;
++		} else if (t == u"grpc"_q) {
++			tr[u"type"_q] = u"grpc"_q;
++			if (!p.serviceName.isEmpty()) {
++				tr[u"service_name"_q] = p.serviceName;
++			}
++		} else if (t == u"http"_q || isHttpOverTcp) {
++			tr[u"type"_q] = u"http"_q;
++			if (!p.path.isEmpty()) {
++				QJsonArray paths; paths.append(p.path);
++				tr[u"path"_q] = paths;
++			}
++			if (!p.host.isEmpty()) {
++				QJsonArray hosts; hosts.append(p.host);
++				tr[u"host"_q] = hosts;
++			}
++		} else {
++			tr[u"type"_q] = t;
++		}
++		o[u"transport"_q] = tr;
++	}
++	return o;
++}
++
++} // namespace
+ 
+ bool VlessParams::valid() const {
+ 	return !server.isEmpty()
+@@ -143,90 +227,33 @@ QString BuildVlessUrl(const VlessParams &p) {
+ }
+ 
+ QString BuildSingboxOutboundJson(const VlessParams &p) {
+-	QJsonObject o;
+-	o[u"type"_q]        = u"vless"_q;
+-	o[u"tag"_q]         = u"proxy"_q;
+-	o[u"server"_q]      = p.server;
+-	o[u"server_port"_q] = int(p.port);
+-	o[u"uuid"_q]        = p.uuid;
+-	if (!p.flow.isEmpty()) {
+-		o[u"flow"_q] = p.flow;
+-	}
++	return QString::fromUtf8(
++		QJsonDocument(BuildVlessOutboundObject(p, u"proxy"_q))
++			.toJson(QJsonDocument::Compact));
++}
+ 
+-	// TLS / Reality
+-	if (p.security == u"tls"_q || p.security == u"reality"_q) {
+-		QJsonObject tls;
+-		tls[u"enabled"_q] = true;
+-		if (!p.sni.isEmpty()) {
+-			tls[u"server_name"_q] = p.sni;
+-		} else {
+-			tls[u"server_name"_q] = p.server;
+-		}
+-		if (p.allowInsecure) {
+-			tls[u"insecure"_q] = true;
+-		}
+-		if (!p.alpn.isEmpty()) {
+-			QJsonArray alpnArr;
+-			for (const auto &a : p.alpn) alpnArr.append(a);
+-			tls[u"alpn"_q] = alpnArr;
+-		}
+-		if (!p.fingerprint.isEmpty()) {
+-			QJsonObject utls;
+-			utls[u"enabled"_q] = true;
+-			utls[u"fingerprint"_q] = p.fingerprint;
+-			tls[u"utls"_q] = utls;
+-		}
+-		if (p.security == u"reality"_q && !p.publicKey.isEmpty()) {
+-			QJsonObject reality;
+-			reality[u"enabled"_q] = true;
+-			reality[u"public_key"_q] = p.publicKey;
+-			if (!p.shortId.isEmpty()) {
+-				reality[u"short_id"_q] = p.shortId;
+-			}
+-			tls[u"reality"_q] = reality;
+-		}
+-		o[u"tls"_q] = tls;
++QString BuildSingboxSubscriptionOutboundsJson(
++		const QList<VlessParams> &servers) {
++	if (servers.isEmpty()) {
++		return QString();
+ 	}
+-
+-	// Transport (omit for plain TCP without http headerType)
+-	const auto t = p.transport;
+-	const auto isHttpOverTcp = (t == u"tcp"_q && p.headerType == u"http"_q);
+-	if (t != u"tcp"_q || isHttpOverTcp) {
+-		QJsonObject tr;
+-		if (t == u"ws"_q) {
+-			tr[u"type"_q] = u"ws"_q;
+-			if (!p.path.isEmpty()) tr[u"path"_q] = p.path;
+-			if (!p.host.isEmpty()) {
+-				QJsonObject h; h[u"Host"_q] = p.host;
+-				tr[u"headers"_q] = h;
+-			}
+-		} else if (t == u"httpupgrade"_q) {
+-			tr[u"type"_q] = u"httpupgrade"_q;
+-			if (!p.path.isEmpty()) tr[u"path"_q] = p.path;
+-			if (!p.host.isEmpty()) tr[u"host"_q] = p.host;
+-		} else if (t == u"grpc"_q) {
+-			tr[u"type"_q] = u"grpc"_q;
+-			if (!p.serviceName.isEmpty()) {
+-				tr[u"service_name"_q] = p.serviceName;
+-			}
+-		} else if (t == u"http"_q || isHttpOverTcp) {
+-			tr[u"type"_q] = u"http"_q;
+-			if (!p.path.isEmpty()) {
+-				QJsonArray paths; paths.append(p.path);
+-				tr[u"path"_q] = paths;
+-			}
+-			if (!p.host.isEmpty()) {
+-				QJsonArray hosts; hosts.append(p.host);
+-				tr[u"host"_q] = hosts;
+-			}
+-		} else {
+-			tr[u"type"_q] = t;
+-		}
+-		o[u"transport"_q] = tr;
++	QJsonArray arr;
++	QJsonArray tags;
++	for (int i = 0; i != servers.size(); ++i) {
++		const auto tag = QStringLiteral("v%1").arg(i);
++		arr.append(BuildVlessOutboundObject(servers[i], tag));
++		tags.append(tag);
+ 	}
+-
++	QJsonObject ut;
++	ut[u"type"_q]      = u"urltest"_q;
++	ut[u"tag"_q]       = u"proxy"_q;
++	ut[u"outbounds"_q] = tags;
++	ut[u"url"_q]       = u"https://www.gstatic.com/generate_204"_q;
++	ut[u"interval"_q]  = u"1m"_q;
++	ut[u"tolerance"_q] = 50;
++	arr.append(ut);
+ 	return QString::fromUtf8(
+-		QJsonDocument(o).toJson(QJsonDocument::Compact));
++		QJsonDocument(arr).toJson(QJsonDocument::Compact));
+ }
+ 
+ } // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_parser.h b/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
+index bd6a7b9000..e73c208df7 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
+@@ -34,5 +34,7 @@ struct VlessParams {
+ [[nodiscard]] std::optional<VlessParams> ParseVlessUrl(const QString &url);
+ [[nodiscard]] QString BuildVlessUrl(const VlessParams &p);
+ [[nodiscard]] QString BuildSingboxOutboundJson(const VlessParams &p);
++[[nodiscard]] QString BuildSingboxSubscriptionOutboundsJson(
++	const QList<VlessParams> &servers);
+ 
+ } // namespace MTP::Proxy
+-- 
+2.54.0.windows.1
+

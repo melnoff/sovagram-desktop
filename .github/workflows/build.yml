@@ -36,13 +36,25 @@ jobs:
           git checkout --detach "$PINNED"
           echo "Submodule HEAD now: $(git rev-parse HEAD)"
 
-      - name: Apply VLESS patch (for singbox sources)
+      - name: Read patches config
+        shell: bash
+        id: patches
+        run: |
+          LIST=$(grep -Ev '^\s*(#|$)' .sync/patches.txt | tr '\n' ' ')
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "Patches: $LIST"
+
+      - name: Apply patches to tdesktop (for singbox sources)
         shell: bash
         run: |
           cd tdesktop
           git config user.email "build-bot@users.noreply.github.com"
           git config user.name "build-bot"
-          git am --3way ../patches/01-vless/*.patch
+          for p in ${{ steps.patches.outputs.list }}; do
+            echo "::group::Apply patches/$p"
+            git am --3way ../patches/$p/*.patch
+            echo "::endgroup::"
+          done
 
       - uses: actions/setup-go@v5
         with:

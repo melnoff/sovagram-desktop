@@ -1,0 +1,377 @@
+From da7a6e901324d786257059635329f6cecfede6e1 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 16:43:22 +0300
+Subject: [PATCH] feat(net): VLESS subscription path through sing-box urltest
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the runtime plumbing for subscription-mode VLESS proxies on top
+of patch 09's parser/fetcher:
+
+  * bridge.go: extracts the inbound + log + route wrapper into a
+    private startBoxWithOutbounds() helper, then exposes
+    SingboxStartSubscription() — accepts a JSON outbounds array
+    (built by BuildSingboxSubscriptionOutboundsJson, includes a
+    "proxy"-tagged urltest selector) and launches the same
+    Socks5-fronted sidecar. SingboxStart() is rewired to share the
+    helper.
+  * VlessBridge: adds ensureRunningSubscription(key, servers) and
+    stopSubscription(key) on a separate _runningSubscriptions map
+    keyed by subscription URL. Loads the new SingboxStartSubscription
+    export and refuses to operate if it is missing. shutdownAll()
+    stops both maps. Common id->Running collection lifted into
+    startAndCollect().
+  * vless_bridge.h gains a forward include of vless_parser.h for
+    the new VlessParams parameter type.
+
+End-to-end this means: one subscription URL → one sing-box sidecar
+that internally urltests across all subscription servers and exposes
+a single stable local Socks5 to tdesktop. UI wiring lands in patch 11.
+---
+ .../mtproto/proxy/vless_bridge.cpp            | 130 +++++++++++++-----
+ .../SourceFiles/mtproto/proxy/vless_bridge.h  |  16 +++
+ Telegram/ThirdParty/singbox_bridge/bridge.go  |  53 +++++--
+ 3 files changed, 147 insertions(+), 52 deletions(-)
+
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+index 2d70bff61b..97a6d1c862 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+@@ -26,6 +26,16 @@ constexpr auto kDllName = "singbox";
+ 		.absoluteFilePath(QStringLiteral("singbox"));
+ }
+ 
++[[nodiscard]] ProxyData MakeSocks5(quint16 port, const QString &user, const QString &pass) {
++	ProxyData out;
++	out.type = ProxyData::Type::Socks5;
++	out.host = QStringLiteral("127.0.0.1");
++	out.port = port;
++	out.user = user;
++	out.password = pass;
++	return out;
++}
++
+ } // namespace
+ 
+ VlessBridge &VlessBridge::instance() {
+@@ -51,13 +61,14 @@ bool VlessBridge::ensureLoaded() {
+ 		return false;
+ 	}
+ 	_start      = (int  (*)(const char*)) _lib->resolve("SingboxStart");
++	_startSub   = (int  (*)(const char*)) _lib->resolve("SingboxStartSubscription");
+ 	_stop       = (int  (*)(int))         _lib->resolve("SingboxStop");
+ 	_getPort    = (int  (*)(int))         _lib->resolve("SingboxGetPort");
+ 	_getUser    = (char*(*)(int))         _lib->resolve("SingboxGetUser");
+ 	_getPass    = (char*(*)(int))         _lib->resolve("SingboxGetPass");
+ 	_lastError  = (char*(*)())            _lib->resolve("SingboxLastError");
+ 	_freeString = (void (*)(char*))       _lib->resolve("SingboxFreeString");
+-	if (!_start || !_stop || !_getPort || !_getUser
++	if (!_start || !_startSub || !_stop || !_getPort || !_getUser
+ 			|| !_getPass || !_lastError || !_freeString) {
+ 		LOG(("VLESS: singbox dll missing exports"));
+ 		_lib->unload();
+@@ -67,6 +78,29 @@ bool VlessBridge::ensureLoaded() {
+ 	return true;
+ }
+ 
++std::optional<VlessBridge::Running> VlessBridge::startAndCollect(int id) {
++	if (id <= 0) {
++		if (_lastError && _freeString) {
++			if (char *err = _lastError()) {
++				LOG(("VLESS: sing-box start failed: %1"
++					).arg(QString::fromUtf8(err)));
++				_freeString(err);
++			}
++		}
++		return std::nullopt;
++	}
++	Running r;
++	r.id = id;
++	r.port = quint16(_getPort(id));
++	char *u = _getUser(id);
++	char *p = _getPass(id);
++	r.user = QString::fromUtf8(u ? u : "");
++	r.pass = QString::fromUtf8(p ? p : "");
++	if (u) _freeString(u);
++	if (p) _freeString(p);
++	return r;
++}
++
+ ProxyData VlessBridge::ensureRunning(const ProxyData &vlessProxy) {
+ 	Expects(vlessProxy.type == ProxyData::Type::Vless);
+ 
+@@ -74,13 +108,7 @@ ProxyData VlessBridge::ensureRunning(const ProxyData &vlessProxy) {
+ 	QMutexLocker lock(&_mu);
+ 
+ 	if (const auto it = _running.find(rawUrl); it != _running.end()) {
+-		ProxyData out;
+-		out.type = ProxyData::Type::Socks5;
+-		out.host = QStringLiteral("127.0.0.1");
+-		out.port = it->second.port;
+-		out.user = it->second.user;
+-		out.password = it->second.pass;
+-		return out;
++		return MakeSocks5(it->second.port, it->second.user, it->second.pass);
+ 	}
+ 
+ 	if (!ensureLoaded()) {
+@@ -95,41 +123,57 @@ ProxyData VlessBridge::ensureRunning(const ProxyData &vlessProxy) {
+ 
+ 	const auto outboundJson = BuildSingboxOutboundJson(*parsed);
+ 	const auto bytes = outboundJson.toUtf8();
+-	const int id = _start(bytes.constData());
+-	if (id <= 0) {
+-		if (_lastError && _freeString) {
+-			if (char *err = _lastError()) {
+-				LOG(("VLESS: sing-box start failed: %1"
+-					).arg(QString::fromUtf8(err)));
+-				_freeString(err);
+-			}
+-		}
++	const auto running = startAndCollect(_start(bytes.constData()));
++	if (!running) {
+ 		return {};
+ 	}
+ 
+-	Running r;
+-	r.id = id;
+-	r.port = quint16(_getPort(id));
+-	char *u = _getUser(id);
+-	char *p = _getPass(id);
+-	r.user = QString::fromUtf8(u ? u : "");
+-	r.pass = QString::fromUtf8(p ? p : "");
+-	if (u) _freeString(u);
+-	if (p) _freeString(p);
+-
+-	_running.emplace(rawUrl, r);
+-
++	_running.emplace(rawUrl, *running);
+ 	LOG(("VLESS: sidecar up for '%1' on 127.0.0.1:%2"
+ 		).arg(parsed->name.isEmpty() ? parsed->server : parsed->name
+-		).arg(r.port));
++		).arg(running->port));
+ 
+-	ProxyData out;
+-	out.type = ProxyData::Type::Socks5;
+-	out.host = QStringLiteral("127.0.0.1");
+-	out.port = r.port;
+-	out.user = r.user;
+-	out.password = r.pass;
+-	return out;
++	return MakeSocks5(running->port, running->user, running->pass);
++}
++
++ProxyData VlessBridge::ensureRunningSubscription(
++		const QString &subscriptionKey,
++		const QList<VlessParams> &servers) {
++	QMutexLocker lock(&_mu);
++
++	if (const auto it = _runningSubscriptions.find(subscriptionKey);
++			it != _runningSubscriptions.end()) {
++		return MakeSocks5(it->second.port, it->second.user, it->second.pass);
++	}
++
++	if (servers.isEmpty()) {
++		LOG(("VLESS: subscription has no servers (%1)").arg(subscriptionKey));
++		return {};
++	}
++
++	if (!ensureLoaded()) {
++		return {};
++	}
++
++	const auto outboundsJson = BuildSingboxSubscriptionOutboundsJson(servers);
++	if (outboundsJson.isEmpty()) {
++		LOG(("VLESS: subscription outbounds JSON is empty (%1)"
++			).arg(subscriptionKey));
++		return {};
++	}
++	const auto bytes = outboundsJson.toUtf8();
++	const auto running = startAndCollect(_startSub(bytes.constData()));
++	if (!running) {
++		return {};
++	}
++
++	_runningSubscriptions.emplace(subscriptionKey, *running);
++	LOG(("VLESS: subscription sidecar up for '%1' (%2 servers) on 127.0.0.1:%3"
++		).arg(subscriptionKey
++		).arg(servers.size()
++		).arg(running->port));
++
++	return MakeSocks5(running->port, running->user, running->pass);
+ }
+ 
+ void VlessBridge::stop(const QString &rawUrl) {
+@@ -140,14 +184,26 @@ void VlessBridge::stop(const QString &rawUrl) {
+ 	_running.erase(it);
+ }
+ 
++void VlessBridge::stopSubscription(const QString &subscriptionKey) {
++	QMutexLocker lock(&_mu);
++	const auto it = _runningSubscriptions.find(subscriptionKey);
++	if (it == _runningSubscriptions.end()) return;
++	if (_stop) _stop(it->second.id);
++	_runningSubscriptions.erase(it);
++}
++
+ void VlessBridge::shutdownAll() {
+ 	QMutexLocker lock(&_mu);
+ 	if (_stop) {
+ 		for (const auto &[url, r] : _running) {
+ 			_stop(r.id);
+ 		}
++		for (const auto &[key, r] : _runningSubscriptions) {
++			_stop(r.id);
++		}
+ 	}
+ 	_running.clear();
++	_runningSubscriptions.clear();
+ 	// Do NOT unload the DLL — Go runtime doesn't survive DLL unload cleanly.
+ 	// The DLL will be released when the process exits.
+ }
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+index a02f61bff6..370976e608 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #pragma once
+ 
+ #include "mtproto/mtproto_proxy_data.h"
++#include "mtproto/proxy/vless_parser.h"
+ #include "base/flat_map.h"
+ 
+ #include <QtCore/QMutex>
+@@ -29,9 +30,20 @@ public:
+ 	// and writes a log line.
+ 	[[nodiscard]] ProxyData ensureRunning(const ProxyData &vlessProxy);
+ 
++	// Same shape as ensureRunning(), but starts a sidecar configured with all
++	// `servers` plus an internal urltest selector — sing-box itself picks and
++	// switches between subscription servers. Reuses an existing sidecar if one
++	// is already running for this subscriptionKey.
++	[[nodiscard]] ProxyData ensureRunningSubscription(
++		const QString &subscriptionKey,
++		const QList<VlessParams> &servers);
++
+ 	// Stop a single VLESS instance (by rawUrl). No-op if not running.
+ 	void stop(const QString &rawUrl);
+ 
++	// Stop a subscription instance (by subscriptionKey). No-op if not running.
++	void stopSubscription(const QString &subscriptionKey);
++
+ 	// Stop all instances and unload the DLL. Call on app shutdown.
+ 	void shutdownAll();
+ 
+@@ -50,11 +62,14 @@ private:
+ 		QString pass;
+ 	};
+ 
++	[[nodiscard]] std::optional<Running> startAndCollect(int id);
++
+ 	QMutex _mu;
+ 	std::unique_ptr<QLibrary> _lib;
+ 
+ 	// Function pointers into singbox.dll
+ 	int   (*_start)(const char*) = nullptr;
++	int   (*_startSub)(const char*) = nullptr;
+ 	int   (*_stop)(int)          = nullptr;
+ 	int   (*_getPort)(int)       = nullptr;
+ 	char* (*_getUser)(int)       = nullptr;
+@@ -63,6 +78,7 @@ private:
+ 	void  (*_freeString)(char*)  = nullptr;
+ 
+ 	base::flat_map<QString, Running> _running;
++	base::flat_map<QString, Running> _runningSubscriptions;
+ };
+ 
+ } // namespace MTP::Proxy
+diff --git a/Telegram/ThirdParty/singbox_bridge/bridge.go b/Telegram/ThirdParty/singbox_bridge/bridge.go
+index c32535eabd..b067013dd8 100644
+--- a/Telegram/ThirdParty/singbox_bridge/bridge.go
++++ b/Telegram/ThirdParty/singbox_bridge/bridge.go
+@@ -9,6 +9,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"net"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"unsafe"
+@@ -57,16 +58,7 @@ func pickFreePort() (int, error) {
+ 	return port, nil
+ }
+ 
+-//export SingboxStart
+-func SingboxStart(outboundJSON *C.char) C.int {
+-	setErr(nil)
+-
+-	outStr := C.GoString(outboundJSON)
+-	if outStr == "" {
+-		setErr(fmt.Errorf("empty outbound json"))
+-		return 0
+-	}
+-
++func startBoxWithOutbounds(outboundsArrayJSON string) C.int {
+ 	port, err := pickFreePort()
+ 	if err != nil {
+ 		setErr(fmt.Errorf("pick port: %w", err))
+@@ -85,12 +77,9 @@ func SingboxStart(outboundJSON *C.char) C.int {
+     "listen_port": %d,
+     "users": [{"username": %q, "password": %q}]
+   }],
+-  "outbounds": [
+-    %s,
+-    {"type": "direct", "tag": "direct"}
+-  ],
++  "outbounds": %s,
+   "route": {"final": "proxy"}
+-}`, port, user, pass, outStr)
++}`, port, user, pass, outboundsArrayJSON)
+ 
+ 	ctx := include.Context(context.Background())
+ 
+@@ -121,6 +110,40 @@ func SingboxStart(outboundJSON *C.char) C.int {
+ 	return C.int(id)
+ }
+ 
++//export SingboxStart
++func SingboxStart(outboundJSON *C.char) C.int {
++	setErr(nil)
++
++	outStr := C.GoString(outboundJSON)
++	if outStr == "" {
++		setErr(fmt.Errorf("empty outbound json"))
++		return 0
++	}
++
++	outbounds := "[" + outStr + `,{"type":"direct","tag":"direct"}]`
++	return startBoxWithOutbounds(outbounds)
++}
++
++//export SingboxStartSubscription
++func SingboxStartSubscription(outboundsArrayJSON *C.char) C.int {
++	setErr(nil)
++
++	arrStr := strings.TrimSpace(C.GoString(outboundsArrayJSON))
++	if arrStr == "" || !strings.HasPrefix(arrStr, "[") || !strings.HasSuffix(arrStr, "]") {
++		setErr(fmt.Errorf("invalid outbounds array json"))
++		return 0
++	}
++
++	inner := strings.TrimSpace(arrStr[1 : len(arrStr)-1])
++	var outbounds string
++	if inner == "" {
++		outbounds = `[{"type":"direct","tag":"direct"}]`
++	} else {
++		outbounds = "[" + inner + `,{"type":"direct","tag":"direct"}]`
++	}
++	return startBoxWithOutbounds(outbounds)
++}
++
+ //export SingboxStop
+ func SingboxStop(id C.int) C.int {
+ 	mu.Lock()
+-- 
+2.54.0.windows.1
+

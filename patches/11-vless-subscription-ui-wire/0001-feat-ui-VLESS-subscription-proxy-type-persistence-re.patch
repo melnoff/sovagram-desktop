@@ -1,0 +1,632 @@
+From 69140fdcb29613f5f6dd081044c9b4622a0e5d3b Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 19:00:33 +0300
+Subject: [PATCH] feat(ui): VLESS subscription proxy type, persistence, refresh
+ wiring
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the user-facing layer that turns a Happ:// or https:// VLESS
+subscription URL into a working proxy. Builds on patches 09 and 10.
+
+  * ProxyData gains Type::VlessSubscription. host stores the
+    subscription URL (port/user/password unused). status() accepts
+    happ://, http(s):// schemes. forUse() pulls the cached server
+    list from SubscriptionCache and hands it to
+    VlessBridge::ensureRunningSubscription so sing-box can urltest
+    internally. ToNetworkProxy and core_settings_proxy serialization
+    case 5 follow.
+
+  * SubscriptionCache (new) — singleton, keyed by subscription URL,
+    stored as JSON in the app data dir (sovagram_subscriptions.json).
+    Servers persist as vless:// strings via BuildVlessUrl/ParseVlessUrl
+    so a subscription proxy works at the next launch without the user
+    re-opening the edit dialog.
+
+  * connection_box: drops the Phase-2A subscription placeholder fields
+    (_vlessSub*) from the single-server VLESS form, adds a separate
+    "VLESS SUB" radio with its own credentials wrap. The form has the
+    subscription URL field, a "Refresh now" link button that drives a
+    SubscriptionFetcher (writes the cache, restarts the sidecar via
+    VlessBridge::stopSubscription), a status line, and a server names
+    list. On open, the form prefills cached names if any.
+
+  * setupTypes/setupControls/handleType/collectData and the
+    type→string switch updated for the new type. SocketAddress is
+    hidden for both Vless variants.
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 183 ++++++++++++------
+ .../SourceFiles/core/core_settings_proxy.cpp  |   2 +
+ .../mtproto/mtproto_proxy_data.cpp            |  26 ++-
+ .../SourceFiles/mtproto/mtproto_proxy_data.h  |   6 +-
+ .../mtproto/proxy/subscription_cache.cpp      | 128 ++++++++++++
+ .../mtproto/proxy/subscription_cache.h        |  54 ++++++
+ Telegram/cmake/td_mtproto.cmake               |   2 +
+ 7 files changed, 335 insertions(+), 66 deletions(-)
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index 7293b6e146..d4701cae2d 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -16,6 +16,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "core/local_url_handlers.h"
+ #include "lang/lang_keys.h"
+ #include "main/main_account.h"
++#include "mtproto/proxy/subscription_cache.h"
++#include "mtproto/proxy/subscription_fetcher.h"
++#include "mtproto/proxy/vless_bridge.h"
+ #include "mtproto/proxy/vless_parser.h"
+ #include "main/main_session.h"
+ #include "mtproto/facade.h"
+@@ -426,9 +429,11 @@ private:
+ 	void setupCredentials(const ProxyData &data);
+ 	void setupMtprotoCredentials(const ProxyData &data);
+ 	void setupVlessCredentials(const ProxyData &data);
++	void setupVlessSubscriptionCredentials(const ProxyData &data);
+ 
+ 	void syncVlessFromUrl();
+ 	void syncVlessFromFields();
++	void refreshSubscription();
+ 
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+@@ -472,10 +477,11 @@ private:
+ 	QPointer<Ui::Checkbox> _vlessAllowInsecure;
+ 	bool _vlessSyncing = false;
+ 
+-	QPointer<Ui::InputField> _vlessSubUrl;
+-	QPointer<Ui::InputField> _vlessSubInterval;
+-	QPointer<Ui::Checkbox> _vlessSubAutoUseNew;
+-	QPointer<Ui::FlatLabel> _vlessSubServersLabel;
++	QPointer<Ui::SlideWrap<Ui::VerticalLayout>> _vlessSubscriptionCredentials;
++	QPointer<Ui::InputField> _subUrl;
++	QPointer<Ui::FlatLabel> _subStatus;
++	QPointer<Ui::FlatLabel> _subServersLabel;
++	std::unique_ptr<MTP::Proxy::SubscriptionFetcher> _subFetcher;
+ 
+ };
+ 
+@@ -1220,6 +1226,15 @@ ProxyData ProxyBox::collectData() {
+ 		}
+ 		return result;
+ 	}
++	if (result.type == Type::VlessSubscription) {
++		// host stores the subscription URL (happ:// or http(s)://).
++		result.host = _subUrl->getLastText().trimmed();
++		if (!result.valid()) {
++			_subUrl->showError();
++			return ProxyData();
++		}
++		return result;
++	}
+ 	result.host = _host->getLastText().trimmed();
+ 	result.port = _port->getLastText().trimmed().toInt();
+ 	result.user = (result.type == Type::Mtproto)
+@@ -1247,10 +1262,11 @@ ProxyData ProxyBox::collectData() {
+ 
+ void ProxyBox::setupTypes() {
+ 	const auto types = std::vector<std::pair<Type, QString>>{
+-		{ Type::Socks5,  "SOCKS5" },
+-		{ Type::Http,    "HTTP" },
+-		{ Type::Mtproto, "MTPROTO" },
+-		{ Type::Vless,   "VLESS" },
++		{ Type::Socks5,            "SOCKS5" },
++		{ Type::Http,              "HTTP" },
++		{ Type::Mtproto,           "MTPROTO" },
++		{ Type::Vless,             "VLESS" },
++		{ Type::VlessSubscription, "VLESS SUB" },
+ 	};
+ 	for (const auto &[type, label] : types) {
+ 		_content->add(
+@@ -1288,7 +1304,9 @@ void ProxyBox::setupSocketAddress(const ProxyData &data) {
+ 		address,
+ 		st::connectionHostInputField,
+ 		tr::lng_connection_host_ph(),
+-		(data.type == Type::Vless) ? QString() : data.host);
++		(data.type == Type::Vless || data.type == Type::VlessSubscription)
++			? QString()
++			: data.host);
+ 	_port = Ui::CreateChild<Ui::NumberInput>(
+ 		address,
+ 		st::connectionPortInputField,
+@@ -1434,56 +1452,6 @@ void ProxyBox::setupVlessCredentials(const ProxyData &data) {
+ 			st::defaultBoxCheckbox),
+ 		st::proxyEditInputPadding + QMargins(0, 6, 0, 6));
+ 
+-	addLabel(inner, QStringLiteral("Subscription (Happ / direct URL)"));
+-
+-	_vlessSubUrl = inner->add(
+-		object_ptr<Ui::InputField>(
+-			inner,
+-			st::connectionUserInputField,
+-			Ui::InputField::Mode::NoNewlines,
+-			rpl::single(QStringLiteral("happ://add/https://... or https://...")),
+-			QString()),
+-		st::proxyEditInputPadding);
+-
+-	addLabel(inner, QStringLiteral("Refresh interval (minutes, 0 = manual only)"));
+-
+-	_vlessSubInterval = inner->add(
+-		object_ptr<Ui::InputField>(
+-			inner,
+-			st::connectionPortInputField,
+-			Ui::InputField::Mode::SingleLine,
+-			rpl::single(QStringLiteral("60")),
+-			QStringLiteral("60")),
+-		st::proxyEditInputPadding);
+-
+-	_vlessSubAutoUseNew = inner->add(
+-		object_ptr<Ui::Checkbox>(
+-			inner,
+-			QStringLiteral("Auto-use new servers in subscriptions"),
+-			false,
+-			st::defaultBoxCheckbox),
+-		st::proxyEditInputPadding + QMargins(0, 6, 0, 6));
+-
+-	const auto refreshBtn = inner->add(
+-		object_ptr<Ui::LinkButton>(
+-			inner,
+-			QStringLiteral("Refresh now")),
+-		st::proxyEditInputPadding);
+-	refreshBtn->setClickedCallback([=] {
+-		// TODO Phase 2B: actual fetch + parse + populate server list.
+-		if (_vlessSubServersLabel) {
+-			_vlessSubServersLabel->setText(
+-				QStringLiteral("(Phase 2B) Fetcher not yet implemented."));
+-		}
+-	});
+-
+-	_vlessSubServersLabel = inner->add(
+-		object_ptr<Ui::FlatLabel>(
+-			inner,
+-			QStringLiteral("Server list will appear here after refresh."),
+-			st::boxLabel),
+-		st::proxyEditInputPadding + QMargins(0, 8, 0, 8));
+-
+ 	_vlessUrl->changes() | rpl::on_next([=] {
+ 		if (_vlessSyncing) return;
+ 		syncVlessFromUrl();
+@@ -1585,6 +1553,96 @@ void ProxyBox::syncVlessFromFields() {
+ 	_vlessSyncing = false;
+ }
+ 
++void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
++	_vlessSubscriptionCredentials = _content->add(
++		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
++			_content,
++			object_ptr<Ui::VerticalLayout>(_content)));
++	const auto inner = _vlessSubscriptionCredentials->entity();
++
++	addLabel(inner, QStringLiteral("Subscription URL (Happ:// or https://)"));
++	_subUrl = inner->add(
++		object_ptr<Ui::InputField>(
++			inner,
++			st::connectionUserInputField,
++			Ui::InputField::Mode::NoNewlines,
++			rpl::single(QStringLiteral("happ://add/https://... or https://...")),
++			(data.type == Type::VlessSubscription) ? data.host : QString()),
++		st::proxyEditInputPadding);
++
++	const auto refreshBtn = inner->add(
++		object_ptr<Ui::LinkButton>(
++			inner,
++			QStringLiteral("Refresh now")),
++		st::proxyEditInputPadding);
++	refreshBtn->setClickedCallback([=] { refreshSubscription(); });
++
++	_subStatus = inner->add(
++		object_ptr<Ui::FlatLabel>(
++			inner,
++			QString(),
++			st::boxLabel),
++		st::proxyEditInputPadding + QMargins(0, 6, 0, 0));
++
++	_subServersLabel = inner->add(
++		object_ptr<Ui::FlatLabel>(
++			inner,
++			QStringLiteral("Click 'Refresh now' to load servers."),
++			st::boxLabel),
++		st::proxyEditInputPadding + QMargins(0, 4, 0, 8));
++
++	if (data.type == Type::VlessSubscription && !data.host.isEmpty()) {
++		const auto cached = MTP::Proxy::SubscriptionCache::instance()
++			.servers(data.host);
++		if (!cached.isEmpty()) {
++			QStringList names;
++			names.reserve(cached.size());
++			for (const auto &p : cached) {
++				names.append(p.name.isEmpty() ? p.server : p.name);
++			}
++			_subStatus->setText(QStringLiteral(
++				"Cached: %1 server(s).").arg(cached.size()));
++			_subServersLabel->setText(names.join(QChar(u'\n')));
++		}
++	}
++}
++
++void ProxyBox::refreshSubscription() {
++	if (!_subUrl || !_subStatus || !_subServersLabel) {
++		return;
++	}
++	const auto url = _subUrl->getLastText().trimmed();
++	if (url.isEmpty()) {
++		_subStatus->setText(QStringLiteral("Subscription URL is empty."));
++		return;
++	}
++	if (!_subFetcher) {
++		_subFetcher = std::make_unique<MTP::Proxy::SubscriptionFetcher>();
++		_subFetcher->done(
++		) | rpl::on_next([=](MTP::Proxy::SubscriptionResult result) {
++			if (!result.error.isEmpty()) {
++				_subStatus->setText(
++					QStringLiteral("Error: ") + result.error);
++				return;
++			}
++			MTP::Proxy::SubscriptionCache::instance().setServers(
++				url,
++				result.servers);
++			MTP::Proxy::VlessBridge::instance().stopSubscription(url);
++			_subStatus->setText(QStringLiteral(
++				"Loaded %1 server(s).").arg(result.servers.size()));
++			QStringList names;
++			names.reserve(result.servers.size());
++			for (const auto &p : result.servers) {
++				names.append(p.name.isEmpty() ? p.server : p.name);
++			}
++			_subServersLabel->setText(names.join(QChar(u'\n')));
++		}, lifetime());
++	}
++	_subStatus->setText(QStringLiteral("Fetching..."));
++	_subFetcher->fetch(url);
++}
++
+ void ProxyBox::setupControls(const ProxyData &data) {
+ 	_type = std::make_shared<Ui::RadioenumGroup<Type>>(
+ 		(data.type == Type::None
+@@ -1599,10 +1657,11 @@ void ProxyBox::setupControls(const ProxyData &data) {
+ 	setupCredentials(data);
+ 	setupMtprotoCredentials(data);
+ 	setupVlessCredentials(data);
++	setupVlessSubscriptionCredentials(data);
+ 
+ 	const auto handleType = [=](Type type) {
+ 		_socketAddress->toggle(
+-			type != Type::Vless,
++			type != Type::Vless && type != Type::VlessSubscription,
+ 			anim::type::instant);
+ 		_credentials->toggle(
+ 			type == Type::Http || type == Type::Socks5,
+@@ -1613,6 +1672,9 @@ void ProxyBox::setupControls(const ProxyData &data) {
+ 		_vlessCredentials->toggle(
+ 			type == Type::Vless,
+ 			anim::type::instant);
++		_vlessSubscriptionCredentials->toggle(
++			type == Type::VlessSubscription,
++			anim::type::instant);
+ 		_aboutSponsored->toggle(
+ 			type == Type::Mtproto,
+ 			anim::type::instant);
+@@ -2331,6 +2393,7 @@ void ProxiesBoxController::updateView(const Item &item) {
+ 		case Type::Socks5: return u"SOCKS5"_q;
+ 		case Type::Mtproto: return u"MTPROTO"_q;
+ 		case Type::Vless: return u"VLESS"_q;
++		case Type::VlessSubscription: return u"VLESS SUB"_q;
+ 		case Type::None: return u"NONE"_q;
+ 		}
+ 		Unexpected("Proxy type in ProxiesBoxController::updateView.");
+diff --git a/Telegram/SourceFiles/core/core_settings_proxy.cpp b/Telegram/SourceFiles/core/core_settings_proxy.cpp
+index 51066d912d..07eac49446 100644
+--- a/Telegram/SourceFiles/core/core_settings_proxy.cpp
++++ b/Telegram/SourceFiles/core/core_settings_proxy.cpp
+@@ -51,6 +51,7 @@ namespace {
+ 		case 2: return MTP::ProxyData::Type::Http;
+ 		case 3: return MTP::ProxyData::Type::Mtproto;
+ 		case 4: return MTP::ProxyData::Type::Vless;
++		case 5: return MTP::ProxyData::Type::VlessSubscription;
+ 		}
+ 		Unexpected("Bad type in DeserializeProxyData");
+ 	}();
+@@ -74,6 +75,7 @@ namespace {
+ 			case MTP::ProxyData::Type::Http: return 2;
+ 			case MTP::ProxyData::Type::Mtproto: return 3;
+ 			case MTP::ProxyData::Type::Vless: return 4;
++			case MTP::ProxyData::Type::VlessSubscription: return 5;
+ 			}
+ 			Unexpected("Bad type in SerializeProxyData");
+ 		}();
+diff --git a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
+index 30f7a018b9..2654946b20 100644
+--- a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
++++ b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
+@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ #include "base/qthelp_url.h"
+ #include "base/qt/qt_string_view.h"
++#include "mtproto/proxy/subscription_cache.h"
+ #include "mtproto/proxy/vless_bridge.h"
+ #include "mtproto/proxy/vless_parser.h"
+ 
+@@ -161,6 +162,13 @@ ProxyData::Status ProxyData::status() const {
+ 		return (parsed && parsed->valid())
+ 			? Status::Valid
+ 			: Status::Invalid;
++	} else if (type == Type::VlessSubscription) {
++		// `host` stores the subscription URL (happ:// or http(s)://).
++		const auto trimmed = host.trimmed();
++		const auto valid = trimmed.startsWith(u"http://"_q, Qt::CaseInsensitive)
++			|| trimmed.startsWith(u"https://"_q, Qt::CaseInsensitive)
++			|| trimmed.startsWith(u"happ://"_q, Qt::CaseInsensitive);
++		return valid ? Status::Valid : Status::Invalid;
+ 	}
+ 	if (type == Type::None || host.isEmpty() || !port) {
+ 		return Status::Invalid;
+@@ -246,7 +254,8 @@ QNetworkProxy ToNetworkProxy(const ProxyData &proxy) {
+ 		return QNetworkProxy::DefaultProxy;
+ 	} else if (proxy.type == ProxyData::Type::Mtproto) {
+ 		return QNetworkProxy::NoProxy;
+-	} else if (proxy.type == ProxyData::Type::Vless) {
++	} else if (proxy.type == ProxyData::Type::Vless
++			|| proxy.type == ProxyData::Type::VlessSubscription) {
+ 		// Callers should resolve via forUse() before reaching here; be safe.
+ 		const auto resolved = proxy.forUse();
+ 		if (resolved.type != ProxyData::Type::Socks5) {
+@@ -265,10 +274,19 @@ QNetworkProxy ToNetworkProxy(const ProxyData &proxy) {
+ }
+ 
+ ProxyData ProxyData::forUse() const {
+-	if (type != Type::Vless) {
+-		return *this;
++	if (type == Type::Vless) {
++		return Proxy::VlessBridge::instance().ensureRunning(*this);
++	} else if (type == Type::VlessSubscription) {
++		const auto servers = Proxy::SubscriptionCache::instance()
++			.servers(host);
++		if (servers.isEmpty()) {
++			return {};
++		}
++		return Proxy::VlessBridge::instance().ensureRunningSubscription(
++			host,
++			servers);
+ 	}
+-	return Proxy::VlessBridge::instance().ensureRunning(*this);
++	return *this;
+ }
+ 
+ } // namespace MTP
+diff --git a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.h b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.h
+index 3c1065f6ed..b62895c7c9 100644
+--- a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.h
++++ b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.h
+@@ -21,6 +21,7 @@ struct ProxyData {
+ 		Http,
+ 		Mtproto,
+ 		Vless,
++		VlessSubscription,
+ 	};
+ 	enum class Status {
+ 		Valid,
+@@ -42,8 +43,9 @@ struct ProxyData {
+ 	[[nodiscard]] bool supportsCalls() const;
+ 	[[nodiscard]] bool tryCustomResolve() const;
+ 
+-	// For Type::Vless, ensures the local sing-box sidecar is running and returns
+-	// an equivalent Socks5 proxy pointing at it. Otherwise returns *this.
++	// For Type::Vless / Type::VlessSubscription, ensures the local sing-box
++	// sidecar is running and returns an equivalent Socks5 proxy pointing at
++	// it. Otherwise returns *this.
+ 	[[nodiscard]] ProxyData forUse() const;
+ 	[[nodiscard]] bytes::vector secretFromMtprotoPassword() const;
+ 	[[nodiscard]] explicit operator bool() const;
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+new file mode 100644
+index 0000000000..db05be9c55
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+@@ -0,0 +1,128 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "mtproto/proxy/subscription_cache.h"
++
++#include "logs.h"
++
++#include <QtCore/QDir>
++#include <QtCore/QFile>
++#include <QtCore/QJsonArray>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QMutexLocker>
++#include <QtCore/QStandardPaths>
++
++namespace MTP::Proxy {
++
++SubscriptionCache &SubscriptionCache::instance() {
++	static SubscriptionCache v;
++	return v;
++}
++
++SubscriptionCache::SubscriptionCache() = default;
++
++QString SubscriptionCache::StoragePath() {
++	const auto base = QStandardPaths::writableLocation(
++		QStandardPaths::AppDataLocation);
++	return QDir(base).absoluteFilePath(
++		QStringLiteral("sovagram_subscriptions.json"));
++}
++
++void SubscriptionCache::ensureLoaded() {
++	if (_loaded) {
++		return;
++	}
++	_loaded = true;
++
++	QFile file(StoragePath());
++	if (!file.exists() || !file.open(QIODevice::ReadOnly)) {
++		return;
++	}
++	const auto bytes = file.readAll();
++	file.close();
++
++	const auto doc = QJsonDocument::fromJson(bytes);
++	if (!doc.isObject()) {
++		return;
++	}
++	const auto subs = doc.object()
++		.value(u"subscriptions"_q).toObject();
++	for (auto it = subs.begin(); it != subs.end(); ++it) {
++		const auto entry = it.value().toObject();
++		const auto serversArray = entry.value(u"servers"_q).toArray();
++		QList<VlessParams> servers;
++		servers.reserve(serversArray.size());
++		for (const auto &v : serversArray) {
++			if (auto p = ParseVlessUrl(v.toString())) {
++				servers.append(std::move(*p));
++			}
++		}
++		if (!servers.isEmpty()) {
++			_entries.emplace(it.key(), std::move(servers));
++		}
++	}
++}
++
++void SubscriptionCache::persist() {
++	QJsonObject root;
++	QJsonObject subs;
++	for (const auto &[url, servers] : _entries) {
++		QJsonArray arr;
++		for (const auto &p : servers) {
++			const auto built = BuildVlessUrl(p);
++			if (!built.isEmpty()) {
++				arr.append(built);
++			}
++		}
++		QJsonObject entry;
++		entry[u"servers"_q] = arr;
++		subs[url] = entry;
++	}
++	root[u"subscriptions"_q] = subs;
++
++	const auto path = StoragePath();
++	QDir().mkpath(QFileInfo(path).absolutePath());
++	QFile file(path);
++	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++		LOG(("SubscriptionCache: cannot write %1: %2"
++			).arg(path, file.errorString()));
++		return;
++	}
++	file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
++	file.close();
++}
++
++QList<VlessParams> SubscriptionCache::servers(
++		const QString &subscriptionUrl) {
++	QMutexLocker lock(&_mu);
++	ensureLoaded();
++	const auto it = _entries.find(subscriptionUrl);
++	return (it == _entries.end()) ? QList<VlessParams>() : it->second;
++}
++
++void SubscriptionCache::setServers(
++		const QString &subscriptionUrl,
++		const QList<VlessParams> &servers) {
++	QMutexLocker lock(&_mu);
++	ensureLoaded();
++	if (servers.isEmpty()) {
++		_entries.erase(subscriptionUrl);
++	} else {
++		_entries[subscriptionUrl] = servers;
++	}
++	persist();
++}
++
++void SubscriptionCache::clear(const QString &subscriptionUrl) {
++	QMutexLocker lock(&_mu);
++	ensureLoaded();
++	_entries.erase(subscriptionUrl);
++	persist();
++}
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+new file mode 100644
+index 0000000000..d52ef72151
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+@@ -0,0 +1,54 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include "mtproto/proxy/vless_parser.h"
++#include "base/flat_map.h"
++
++#include <QtCore/QMutex>
++
++namespace MTP::Proxy {
++
++// In-memory + disk-backed cache of fetched VLESS subscription server lists,
++// keyed by the user-visible subscription URL (happ:// or https://).
++//
++// Servers are persisted as vless:// strings in a single JSON file under the
++// application data dir; on next launch they are re-parsed via ParseVlessUrl.
++// This lets a Type::VlessSubscription proxy connect at startup using the
++// last known good server list, without requiring the user to open the
++// proxy edit dialog and refresh first.
++class SubscriptionCache final {
++public:
++	static SubscriptionCache &instance();
++
++	[[nodiscard]] QList<VlessParams> servers(
++		const QString &subscriptionUrl);
++
++	void setServers(
++		const QString &subscriptionUrl,
++		const QList<VlessParams> &servers);
++
++	void clear(const QString &subscriptionUrl);
++
++private:
++	SubscriptionCache();
++	~SubscriptionCache() = default;
++	SubscriptionCache(const SubscriptionCache &) = delete;
++	SubscriptionCache &operator=(const SubscriptionCache &) = delete;
++
++	void ensureLoaded();
++	void persist();
++
++	[[nodiscard]] static QString StoragePath();
++
++	QMutex _mu;
++	bool _loaded = false;
++	base::flat_map<QString, QList<VlessParams>> _entries;
++};
++
++} // namespace MTP::Proxy
+diff --git a/Telegram/cmake/td_mtproto.cmake b/Telegram/cmake/td_mtproto.cmake
+index 71b0079e01..9a90ea3c90 100644
+--- a/Telegram/cmake/td_mtproto.cmake
++++ b/Telegram/cmake/td_mtproto.cmake
+@@ -50,6 +50,8 @@ PRIVATE
+     mtproto/mtproto_proxy_data.h
+     mtproto/mtproto_response.cpp
+     mtproto/mtproto_response.h
++    mtproto/proxy/subscription_cache.cpp
++    mtproto/proxy/subscription_cache.h
+     mtproto/proxy/vless_bridge.cpp
+     mtproto/proxy/vless_bridge.h
+     mtproto/proxy/vless_parser.cpp
+-- 
+2.54.0.windows.1
+
