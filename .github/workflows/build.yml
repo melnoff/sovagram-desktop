@@ -29,7 +29,7 @@ jobs:
           cd tdesktop
           git config user.email "build-bot@users.noreply.github.com"
           git config user.name "build-bot"
-          git am --3way --keep-cr ../patches/vless/*.patch
+          git am --3way --keep-cr ../patches/01-vless/*.patch
 
       - uses: actions/setup-go@v5
         with:
