@@ -1,0 +1,95 @@
+From f95c6c3e0219bf59c91312c57a253c7a68633290 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 16:15:01 +0300
+Subject: [PATCH] feat(ui): subscription UI placeholder in VLESS form
+
+Adds the visual placeholder for VLESS subscription support in the
+proxy edit dialog: subscription URL field, refresh interval input,
+auto-use new servers checkbox, 'Refresh now' link button (currently
+a no-op), and a server list label that says 'Server list will appear
+here after refresh.'
+
+Backend (Happ:// fetcher, base64 decode, vless:// extraction,
+sing-box urltest config, Clash API monitoring, persistence) lands
+in the next patch (Phase 2B). This patch is purely the form layout
+so the structure can be visually reviewed before the wiring work.
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 55 +++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index 90a4667ec5..7293b6e146 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -472,6 +472,11 @@ private:
+ 	QPointer<Ui::Checkbox> _vlessAllowInsecure;
+ 	bool _vlessSyncing = false;
+ 
++	QPointer<Ui::InputField> _vlessSubUrl;
++	QPointer<Ui::InputField> _vlessSubInterval;
++	QPointer<Ui::Checkbox> _vlessSubAutoUseNew;
++	QPointer<Ui::FlatLabel> _vlessSubServersLabel;
++
+ };
+ 
+ ProxyRow::ProxyRow(QWidget *parent, View &&view)
+@@ -1429,6 +1434,56 @@ void ProxyBox::setupVlessCredentials(const ProxyData &data) {
+ 			st::defaultBoxCheckbox),
+ 		st::proxyEditInputPadding + QMargins(0, 6, 0, 6));
+ 
++	addLabel(inner, QStringLiteral("Subscription (Happ / direct URL)"));
++
++	_vlessSubUrl = inner->add(
++		object_ptr<Ui::InputField>(
++			inner,
++			st::connectionUserInputField,
++			Ui::InputField::Mode::NoNewlines,
++			rpl::single(QStringLiteral("happ://add/https://... or https://...")),
++			QString()),
++		st::proxyEditInputPadding);
++
++	addLabel(inner, QStringLiteral("Refresh interval (minutes, 0 = manual only)"));
++
++	_vlessSubInterval = inner->add(
++		object_ptr<Ui::InputField>(
++			inner,
++			st::connectionPortInputField,
++			Ui::InputField::Mode::SingleLine,
++			rpl::single(QStringLiteral("60")),
++			QStringLiteral("60")),
++		st::proxyEditInputPadding);
++
++	_vlessSubAutoUseNew = inner->add(
++		object_ptr<Ui::Checkbox>(
++			inner,
++			QStringLiteral("Auto-use new servers in subscriptions"),
++			false,
++			st::defaultBoxCheckbox),
++		st::proxyEditInputPadding + QMargins(0, 6, 0, 6));
++
++	const auto refreshBtn = inner->add(
++		object_ptr<Ui::LinkButton>(
++			inner,
++			QStringLiteral("Refresh now")),
++		st::proxyEditInputPadding);
++	refreshBtn->setClickedCallback([=] {
++		// TODO Phase 2B: actual fetch + parse + populate server list.
++		if (_vlessSubServersLabel) {
++			_vlessSubServersLabel->setText(
++				QStringLiteral("(Phase 2B) Fetcher not yet implemented."));
++		}
++	});
++
++	_vlessSubServersLabel = inner->add(
++		object_ptr<Ui::FlatLabel>(
++			inner,
++			QStringLiteral("Server list will appear here after refresh."),
++			st::boxLabel),
++		st::proxyEditInputPadding + QMargins(0, 8, 0, 8));
++
+ 	_vlessUrl->changes() | rpl::on_next([=] {
+ 		if (_vlessSyncing) return;
+ 		syncVlessFromUrl();
+-- 
+2.54.0.windows.1
+

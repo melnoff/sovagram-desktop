@@ -1,0 +1,37 @@
+From 2ac7afeb404a822faba24f5ea40c31085f12c283 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 13:31:12 +0300
+Subject: [PATCH] feat(ui): hide the dialogs stories carousel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Always pass nullptr to _stories instead of constructing a
+Stories::List. Removes the 'кружочки' that appeared above the
+dialogs list. All other code paths already nullcheck _stories,
+so no further plumbing needed.
+---
+ Telegram/SourceFiles/dialogs/dialogs_widget.cpp | 7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+index ec971de510..83dadb4e98 100644
+--- a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+@@ -367,12 +367,7 @@ Widget::Widget(
+ 	object_ptr<Ui::IconButton>(this, st::dialogsLock))
+ , _scroll(this)
+ , _scrollToTop(_scroll, st::dialogsToUp)
+-, _stories((_layout != Layout::Child)
+-	? std::make_unique<Stories::List>(
+-		this,
+-		st::dialogsStoriesList,
+-		_storiesContents.events() | rpl::flatten_latest())
+-	: nullptr)
++, _stories(nullptr)
+ , _searchTimer([=] { search(); })
+ , _peerSearch(&controller->session(), Api::PeerSearch::Type::WithSponsored)
+ , _singleMessageSearch(&controller->session()) {
+-- 
+2.54.0.windows.1
+

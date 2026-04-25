@@ -1,0 +1,107 @@
+From 50fbfca26fe0059ac09c1ccaee893123864b2e7a Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 13:31:21 +0300
+Subject: [PATCH] feat(ui): toggle to hide story rings on avatars
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds an Advanced settings toggle 'Hide story rings on avatars',
+stored via writePref<bool>(kHideStoriesOnAvatarsKey). When
+enabled, PeerData::hasActiveStories() returns false unconditionally,
+which removes the colored story ring from every userpic in the
+chat list, peer lists, and profile top bars (and disables the
+click-to-open-story behavior on those avatars). Has no effect on
+data — stories themselves still exist server-side.
+---
+ Telegram/Resources/langs/lang.strings         |  1 +
+ Telegram/SourceFiles/core/core_settings.h     |  3 +++
+ Telegram/SourceFiles/data/data_peer.cpp       |  5 +++++
+ .../settings/sections/settings_advanced.cpp   | 22 +++++++++++++++++++
+ 4 files changed, 31 insertions(+)
+
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 9fb4f4f18f..549d8a5478 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -7032,6 +7032,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ "lng_settings_round_videos_section" = "Video messages";
+ "lng_settings_hide_round_videos" = "Hide round video messages";
++"lng_settings_hide_stories_on_avatars" = "Hide story rings on avatars";
+ 
+ "lng_filters_all" = "All chats";
+ "lng_filters_all_short" = "All";
+diff --git a/Telegram/SourceFiles/core/core_settings.h b/Telegram/SourceFiles/core/core_settings.h
+index 4e73983a9c..a2e85159f0 100644
+--- a/Telegram/SourceFiles/core/core_settings.h
++++ b/Telegram/SourceFiles/core/core_settings.h
+@@ -42,6 +42,9 @@ inline constexpr auto kScreenReaderModeDisabledKey
+ inline constexpr auto kHideRoundVideosKey
+ 	= "hide-round-videos"_cs;
+ 
++inline constexpr auto kHideStoriesOnAvatarsKey
++	= "hide-stories-on-avatars"_cs;
++
+ struct WindowPosition {
+ 	int32 moncrc = 0;
+ 	int maximized = 0;
+diff --git a/Telegram/SourceFiles/data/data_peer.cpp b/Telegram/SourceFiles/data/data_peer.cpp
+index 2669111e09..f27f5ed230 100644
+--- a/Telegram/SourceFiles/data/data_peer.cpp
++++ b/Telegram/SourceFiles/data/data_peer.cpp
+@@ -36,6 +36,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "main/main_app_config.h"
+ #include "mtproto/mtproto_config.h"
+ #include "core/application.h"
++#include "core/core_settings.h"
+ #include "core/click_handler_types.h"
+ #include "window/notifications_manager.h"
+ #include "window/window_session_controller.h"
+@@ -1983,6 +1984,10 @@ const Data::WallPaper *PeerData::wallPaper() const {
+ }
+ 
+ bool PeerData::hasActiveStories() const {
++	if (Core::App().settings().readPref<bool>(
++			Core::kHideStoriesOnAvatarsKey)) {
++		return false;
++	}
+ 	if (const auto user = asUser()) {
+ 		return user->hasActiveStories();
+ 	} else if (const auto channel = asChannel()) {
+diff --git a/Telegram/SourceFiles/settings/sections/settings_advanced.cpp b/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
+index 998e133cea..b90fdb1860 100644
+--- a/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
++++ b/Telegram/SourceFiles/settings/sections/settings_advanced.cpp
+@@ -1212,6 +1212,28 @@ void BuildRoundVideosSection(SectionBuilder &builder) {
+ 		}, toggle->lifetime());
+ 	}
+ 
++	const auto storiesToggle = builder.addButton({
++		.id = u"advanced/stories_avatars_hide"_q,
++		.title = tr::lng_settings_hide_stories_on_avatars(),
++		.st = &st::settingsButtonNoIcon,
++		.toggled = rpl::single(Core::App().settings().readPref<bool>(
++			Core::kHideStoriesOnAvatarsKey)),
++		.keywords = { u"stories"_q, u"avatar"_q, u"ring"_q, u"circles"_q },
++	});
++
++	if (storiesToggle) {
++		storiesToggle->toggledValue(
++		) | rpl::filter([=](bool value) {
++			return (value != Core::App().settings().readPref<bool>(
++				Core::kHideStoriesOnAvatarsKey));
++		}) | rpl::on_next([=](bool value) {
++			Core::App().settings().writePref<bool>(
++				Core::kHideStoriesOnAvatarsKey,
++				value);
++			Core::App().saveSettingsDelayed();
++		}, storiesToggle->lifetime());
++	}
++
+ 	builder.addSkip();
+ }
+ 
+-- 
+2.54.0.windows.1
+

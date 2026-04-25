@@ -1,0 +1,342 @@
+From 5ea9d778b46204255a874033d3ac33843bf5fdf6 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sat, 25 Apr 2026 15:41:56 +0300
+Subject: [PATCH] feat(ui): redesign VLESS proxy form
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- URL input is now multi-line (5-line min, auto-grow up to ~12
+  lines, then scroll). Long vless:// URLs are no longer cropped.
+- Below the URL, a flat list of editable parameter fields:
+  server, port, uuid, flow, security, sni, alpn, fingerprint,
+  reality public key, reality short ID, transport, path, host,
+  gRPC service name, header type, name, allowInsecure checkbox.
+- Two-way sync: editing the URL repopulates the fields; editing
+  any field rebuilds the URL. A guard flag breaks the loop so
+  setText calls don't re-trigger the opposite direction.
+- Adds MTP::Proxy::BuildVlessUrl() — inverse of ParseVlessUrl().
+
+The URL field still drives saving (collectData uses the URL text),
+so all backend code paths are unchanged.
+---
+ Telegram/SourceFiles/boxes/boxes.style        |   5 +
+ Telegram/SourceFiles/boxes/connection_box.cpp | 168 +++++++++++++++++-
+ .../mtproto/proxy/vless_parser.cpp            |  65 +++++++
+ .../SourceFiles/mtproto/proxy/vless_parser.h  |   1 +
+ 4 files changed, 236 insertions(+), 3 deletions(-)
+
+diff --git a/Telegram/SourceFiles/boxes/boxes.style b/Telegram/SourceFiles/boxes/boxes.style
+index 0698689800..8961097d0e 100644
+--- a/Telegram/SourceFiles/boxes/boxes.style
++++ b/Telegram/SourceFiles/boxes/boxes.style
+@@ -381,6 +381,11 @@ connectionHostInputField: InputField(defaultInputField) {
+ connectionPortInputField: InputField(defaultInputField) {
+ 	width: 55px;
+ }
++connectionVlessUrlField: InputField(defaultInputField) {
++	textMargins: margins(0px, 6px, 0px, 6px);
++	heightMin: 120px;
++	heightMax: 280px;
++}
+ connectionUserInputField: InputField(defaultInputField) {
+ }
+ connectionPasswordInputField: InputField(defaultInputField) {
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index a36f74944f..90a4667ec5 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -16,6 +16,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "core/local_url_handlers.h"
+ #include "lang/lang_keys.h"
+ #include "main/main_account.h"
++#include "mtproto/proxy/vless_parser.h"
+ #include "main/main_session.h"
+ #include "mtproto/facade.h"
+ #include "settings/settings_common.h"
+@@ -426,6 +427,9 @@ private:
+ 	void setupMtprotoCredentials(const ProxyData &data);
+ 	void setupVlessCredentials(const ProxyData &data);
+ 
++	void syncVlessFromUrl();
++	void syncVlessFromFields();
++
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+ 		const QString &text) const;
+@@ -449,6 +453,24 @@ private:
+ 	QPointer<Ui::SlideWrap<Ui::VerticalLayout>> _mtprotoCredentials;
+ 	QPointer<Ui::SlideWrap<Ui::VerticalLayout>> _vlessCredentials;
+ 	QPointer<Ui::InputField> _vlessUrl;
++	QPointer<Ui::InputField> _vlessServer;
++	QPointer<Ui::InputField> _vlessPort;
++	QPointer<Ui::InputField> _vlessUuid;
++	QPointer<Ui::InputField> _vlessFlow;
++	QPointer<Ui::InputField> _vlessSecurity;
++	QPointer<Ui::InputField> _vlessSni;
++	QPointer<Ui::InputField> _vlessAlpn;
++	QPointer<Ui::InputField> _vlessFingerprint;
++	QPointer<Ui::InputField> _vlessPublicKey;
++	QPointer<Ui::InputField> _vlessShortId;
++	QPointer<Ui::InputField> _vlessTransport;
++	QPointer<Ui::InputField> _vlessPath;
++	QPointer<Ui::InputField> _vlessHost;
++	QPointer<Ui::InputField> _vlessServiceName;
++	QPointer<Ui::InputField> _vlessHeaderType;
++	QPointer<Ui::InputField> _vlessName;
++	QPointer<Ui::Checkbox> _vlessAllowInsecure;
++	bool _vlessSyncing = false;
+ 
+ };
+ 
+@@ -1348,9 +1370,9 @@ void ProxyBox::setupVlessCredentials(const ProxyData &data) {
+ 	_vlessUrl = inner->add(
+ 		object_ptr<Ui::InputField>(
+ 			inner,
+-			st::connectionHostInputField,
+-			Ui::InputField::Mode::NoNewlines,
+-			rpl::single(QStringLiteral("vless://...")),
++			st::connectionVlessUrlField,
++			Ui::InputField::Mode::MultiLine,
++			rpl::single(QStringLiteral("vless://uuid@host:port?security=...&type=...")),
+ 			(data.type == Type::Vless) ? data.host : QString()),
+ 		st::proxyEditInputPadding);
+ 
+@@ -1366,6 +1388,146 @@ void ProxyBox::setupVlessCredentials(const ProxyData &data) {
+ 			_vlessUrl->setText(text);
+ 		}
+ 	});
++
++	const auto makeRow = [&](
++			const QString &label,
++			QPointer<Ui::InputField> &field) {
++		addLabel(inner, label);
++		field = inner->add(
++			object_ptr<Ui::InputField>(
++				inner,
++				st::connectionUserInputField,
++				Ui::InputField::Mode::SingleLine,
++				rpl::single(QString())),
++			st::proxyEditInputPadding);
++	};
++
++	addLabel(inner, QStringLiteral("Parsed parameters"));
++
++	makeRow(QStringLiteral("Server"),         _vlessServer);
++	makeRow(QStringLiteral("Port"),           _vlessPort);
++	makeRow(QStringLiteral("UUID"),           _vlessUuid);
++	makeRow(QStringLiteral("Flow"),           _vlessFlow);
++	makeRow(QStringLiteral("Security (none/tls/reality)"), _vlessSecurity);
++	makeRow(QStringLiteral("SNI"),            _vlessSni);
++	makeRow(QStringLiteral("ALPN (comma separated)"),      _vlessAlpn);
++	makeRow(QStringLiteral("Fingerprint (utls)"),          _vlessFingerprint);
++	makeRow(QStringLiteral("Reality public key"),          _vlessPublicKey);
++	makeRow(QStringLiteral("Reality short ID"),            _vlessShortId);
++	makeRow(QStringLiteral("Transport (tcp/ws/grpc/...)"), _vlessTransport);
++	makeRow(QStringLiteral("Path"),                        _vlessPath);
++	makeRow(QStringLiteral("Host header"),                 _vlessHost);
++	makeRow(QStringLiteral("gRPC service name"),           _vlessServiceName);
++	makeRow(QStringLiteral("Header type"),                 _vlessHeaderType);
++	makeRow(QStringLiteral("Name (label)"),                _vlessName);
++
++	_vlessAllowInsecure = inner->add(
++		object_ptr<Ui::Checkbox>(
++			inner,
++			QStringLiteral("Allow insecure TLS"),
++			false,
++			st::defaultBoxCheckbox),
++		st::proxyEditInputPadding + QMargins(0, 6, 0, 6));
++
++	_vlessUrl->changes() | rpl::on_next([=] {
++		if (_vlessSyncing) return;
++		syncVlessFromUrl();
++	}, _vlessUrl->lifetime());
++
++	const auto rebuild = [=] {
++		if (_vlessSyncing) return;
++		syncVlessFromFields();
++	};
++	for (const auto field : {
++			_vlessServer.data(), _vlessPort.data(), _vlessUuid.data(),
++			_vlessFlow.data(),   _vlessSecurity.data(), _vlessSni.data(),
++			_vlessAlpn.data(),   _vlessFingerprint.data(),
++			_vlessPublicKey.data(), _vlessShortId.data(),
++			_vlessTransport.data(), _vlessPath.data(), _vlessHost.data(),
++			_vlessServiceName.data(), _vlessHeaderType.data(),
++			_vlessName.data() }) {
++		field->changes() | rpl::on_next(rebuild, field->lifetime());
++	}
++	_vlessAllowInsecure->checkedChanges() | rpl::on_next(
++		[=](bool) { rebuild(); },
++		_vlessAllowInsecure->lifetime());
++
++	if (data.type == Type::Vless && !data.host.isEmpty()) {
++		syncVlessFromUrl();
++	}
++}
++
++void ProxyBox::syncVlessFromUrl() {
++	if (!_vlessUrl) return;
++	const auto parsed = MTP::Proxy::ParseVlessUrl(
++		_vlessUrl->getLastText().trimmed());
++	if (!parsed) return;
++	_vlessSyncing = true;
++	const auto setText = [](Ui::InputField *f, const QString &v) {
++		if (f && f->getLastText() != v) f->setText(v);
++	};
++	setText(_vlessServer.data(),       parsed->server);
++	setText(_vlessPort.data(),         QString::number(parsed->port));
++	setText(_vlessUuid.data(),         parsed->uuid);
++	setText(_vlessFlow.data(),         parsed->flow);
++	setText(_vlessSecurity.data(),     parsed->security);
++	setText(_vlessSni.data(),          parsed->sni);
++	setText(_vlessAlpn.data(),         parsed->alpn.join(QChar(',')));
++	setText(_vlessFingerprint.data(),  parsed->fingerprint);
++	setText(_vlessPublicKey.data(),    parsed->publicKey);
++	setText(_vlessShortId.data(),      parsed->shortId);
++	setText(_vlessTransport.data(),    parsed->transport);
++	setText(_vlessPath.data(),         parsed->path);
++	setText(_vlessHost.data(),         parsed->host);
++	setText(_vlessServiceName.data(),  parsed->serviceName);
++	setText(_vlessHeaderType.data(),   parsed->headerType);
++	setText(_vlessName.data(),         parsed->name);
++	if (_vlessAllowInsecure
++		&& _vlessAllowInsecure->checked() != parsed->allowInsecure) {
++		_vlessAllowInsecure->setChecked(
++			parsed->allowInsecure,
++			Ui::Checkbox::NotifyAboutChange::DontNotify);
++	}
++	_vlessSyncing = false;
++}
++
++void ProxyBox::syncVlessFromFields() {
++	if (!_vlessUrl) return;
++	MTP::Proxy::VlessParams p;
++	p.server      = _vlessServer ? _vlessServer->getLastText().trimmed() : QString();
++	p.port        = _vlessPort
++		? quint16(_vlessPort->getLastText().trimmed().toUInt())
++		: 0;
++	p.uuid        = _vlessUuid ? _vlessUuid->getLastText().trimmed() : QString();
++	p.flow        = _vlessFlow ? _vlessFlow->getLastText().trimmed() : QString();
++	p.security    = _vlessSecurity ? _vlessSecurity->getLastText().trimmed() : QString();
++	p.sni         = _vlessSni ? _vlessSni->getLastText().trimmed() : QString();
++	const auto alpnText = _vlessAlpn ? _vlessAlpn->getLastText().trimmed() : QString();
++	if (!alpnText.isEmpty()) {
++		p.alpn = alpnText.split(u',', Qt::SkipEmptyParts);
++		for (auto &a : p.alpn) a = a.trimmed();
++	}
++	p.fingerprint = _vlessFingerprint ? _vlessFingerprint->getLastText().trimmed() : QString();
++	p.publicKey   = _vlessPublicKey ? _vlessPublicKey->getLastText().trimmed() : QString();
++	p.shortId     = _vlessShortId ? _vlessShortId->getLastText().trimmed() : QString();
++	p.transport   = _vlessTransport ? _vlessTransport->getLastText().trimmed() : QString();
++	p.path        = _vlessPath ? _vlessPath->getLastText().trimmed() : QString();
++	p.host        = _vlessHost ? _vlessHost->getLastText().trimmed() : QString();
++	p.serviceName = _vlessServiceName ? _vlessServiceName->getLastText().trimmed() : QString();
++	p.headerType  = _vlessHeaderType ? _vlessHeaderType->getLastText().trimmed() : QString();
++	p.name        = _vlessName ? _vlessName->getLastText().trimmed() : QString();
++	p.allowInsecure = _vlessAllowInsecure && _vlessAllowInsecure->checked();
++
++	if (p.server.isEmpty() || p.port == 0 || p.uuid.isEmpty()) {
++		return;
++	}
++	const auto built = MTP::Proxy::BuildVlessUrl(p);
++	if (built.isEmpty() || _vlessUrl->getLastText() == built) {
++		return;
++	}
++	_vlessSyncing = true;
++	_vlessUrl->setText(built);
++	_vlessSyncing = false;
+ }
+ 
+ void ProxyBox::setupControls(const ProxyData &data) {
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp b/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
+index a921447e5a..248c61ff85 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_parser.cpp
+@@ -77,6 +77,71 @@ std::optional<VlessParams> ParseVlessUrl(const QString &input) {
+ 	return p.valid() ? std::optional<VlessParams>(std::move(p)) : std::nullopt;
+ }
+ 
++QString BuildVlessUrl(const VlessParams &p) {
++	if (p.uuid.isEmpty() || p.server.isEmpty() || p.port == 0) {
++		return QString();
++	}
++	const auto encUuid = QString::fromLatin1(
++		QUrl::toPercentEncoding(p.uuid));
++	const auto encServer = p.server.contains(QChar(':'))
++		? (u"["_q + p.server + u"]"_q)
++		: p.server;
++
++	QUrlQuery q;
++	if (!p.security.isEmpty() && p.security != u"none"_q) {
++		q.addQueryItem(u"security"_q, p.security);
++	}
++	if (!p.flow.isEmpty()) {
++		q.addQueryItem(u"flow"_q, p.flow);
++	}
++	if (!p.transport.isEmpty() && p.transport != u"tcp"_q) {
++		q.addQueryItem(u"type"_q, p.transport);
++	}
++	if (!p.sni.isEmpty()) {
++		q.addQueryItem(u"sni"_q, p.sni);
++	}
++	if (!p.alpn.isEmpty()) {
++		q.addQueryItem(u"alpn"_q, p.alpn.join(QChar(',')));
++	}
++	if (!p.fingerprint.isEmpty()) {
++		q.addQueryItem(u"fp"_q, p.fingerprint);
++	}
++	if (!p.publicKey.isEmpty()) {
++		q.addQueryItem(u"pbk"_q, p.publicKey);
++	}
++	if (!p.shortId.isEmpty()) {
++		q.addQueryItem(u"sid"_q, p.shortId);
++	}
++	if (!p.path.isEmpty()) {
++		q.addQueryItem(u"path"_q, p.path);
++	}
++	if (!p.host.isEmpty()) {
++		q.addQueryItem(u"host"_q, p.host);
++	}
++	if (!p.serviceName.isEmpty()) {
++		q.addQueryItem(u"serviceName"_q, p.serviceName);
++	}
++	if (!p.headerType.isEmpty() && p.headerType != u"none"_q) {
++		q.addQueryItem(u"headerType"_q, p.headerType);
++	}
++	if (p.allowInsecure) {
++		q.addQueryItem(u"allowInsecure"_q, u"1"_q);
++	}
++
++	auto url = u"vless://"_q
++		+ encUuid + QChar('@')
++		+ encServer + QChar(':') + QString::number(p.port);
++	const auto query = q.query();
++	if (!query.isEmpty()) {
++		url += QChar('?') + query;
++	}
++	if (!p.name.isEmpty()) {
++		url += QChar('#') + QString::fromLatin1(
++			QUrl::toPercentEncoding(p.name));
++	}
++	return url;
++}
++
+ QString BuildSingboxOutboundJson(const VlessParams &p) {
+ 	QJsonObject o;
+ 	o[u"type"_q]        = u"vless"_q;
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_parser.h b/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
+index fa80c11829..bd6a7b9000 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_parser.h
+@@ -32,6 +32,7 @@ struct VlessParams {
+ };
+ 
+ [[nodiscard]] std::optional<VlessParams> ParseVlessUrl(const QString &url);
++[[nodiscard]] QString BuildVlessUrl(const VlessParams &p);
+ [[nodiscard]] QString BuildSingboxOutboundJson(const VlessParams &p);
+ 
+ } // namespace MTP::Proxy
+-- 
+2.54.0.windows.1
+
