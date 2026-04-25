@@ -140,9 +140,9 @@ jobs:
         run: |
           mkdir %userprofile%\TBuild\Libraries
           mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          mklink /j %GITHUB_WORKSPACE%\TBuild\tdesktop %GITHUB_WORKSPACE%\tdesktop
           echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
           echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries>>%GITHUB_ENV%
-          mklink /j %TBUILD%\tdesktop %GITHUB_WORKSPACE%\tdesktop
 
       - name: Read cache key
         shell: bash
