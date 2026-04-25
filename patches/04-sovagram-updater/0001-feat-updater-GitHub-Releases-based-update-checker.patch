@@ -1,4 +1,4 @@
-From 92c934424d064585f0acddced199847ddf6aef7e Mon Sep 17 00:00:00 2001
+From 9a0c2ebd89c3708e97d68b3095140fb960e1ca54 Mon Sep 17 00:00:00 2001
 From: Ivan Melnikov <mail@melnoff.com>
 Date: Sat, 25 Apr 2026 00:16:32 +0300
 Subject: [PATCH] feat(updater): GitHub Releases-based update checker
@@ -21,14 +21,14 @@ simply never finds valid signed updates for our unofficial build.
  Telegram/CMakeLists.txt                       |  14 ++
  Telegram/Resources/langs/lang.strings         |   5 +
  Telegram/SourceFiles/core/application.cpp     |   3 +
- .../SourceFiles/core/sovagram_updater.cpp     | 148 ++++++++++++++++++
+ .../SourceFiles/core/sovagram_updater.cpp     | 147 ++++++++++++++++++
  Telegram/SourceFiles/core/sovagram_updater.h  |  12 ++
- 5 files changed, 182 insertions(+)
+ 5 files changed, 181 insertions(+)
  create mode 100644 Telegram/SourceFiles/core/sovagram_updater.cpp
  create mode 100644 Telegram/SourceFiles/core/sovagram_updater.h
 
 diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
-index a1fae40a00..cc971ea4c2 100644
+index 2a7a95a453..5dcf134f38 100644
 --- a/Telegram/CMakeLists.txt
 +++ b/Telegram/CMakeLists.txt
 @@ -547,6 +547,8 @@ PRIVATE
@@ -40,7 +40,7 @@ index a1fae40a00..cc971ea4c2 100644
      core/ui_integration.cpp
      core/ui_integration.h
      core/update_checker.cpp
-@@ -2125,6 +2127,18 @@ PRIVATE
+@@ -2137,6 +2139,18 @@ PRIVATE
      G_LOG_DOMAIN="Telegram"
  )
  
@@ -60,7 +60,7 @@ index a1fae40a00..cc971ea4c2 100644
  if (APPLE
      OR is_multi_config
 diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
-index 226614677b..8aff6acf50 100644
+index 265205f23c..9fb4f4f18f 100644
 --- a/Telegram/Resources/langs/lang.strings
 +++ b/Telegram/Resources/langs/lang.strings
 @@ -130,6 +130,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
@@ -76,10 +76,10 @@ index 226614677b..8aff6acf50 100644
  "lng_maximize_window" = "Maximize";
  "lng_restore_window" = "Restore";
 diff --git a/Telegram/SourceFiles/core/application.cpp b/Telegram/SourceFiles/core/application.cpp
-index de4b20765a..08b39ffd3e 100644
+index 4e7d8b7a8e..22072d53e6 100644
 --- a/Telegram/SourceFiles/core/application.cpp
 +++ b/Telegram/SourceFiles/core/application.cpp
-@@ -25,6 +25,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+@@ -26,6 +26,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
  #include "core/update_checker.h"
  #include "core/shortcuts.h"
  #include "core/sandbox.h"
@@ -87,7 +87,7 @@ index de4b20765a..08b39ffd3e 100644
  #include "core/local_url_handlers.h"
  #include "core/launcher.h"
  #include "core/ui_integration.h"
-@@ -402,6 +403,8 @@ void Application::run() {
+@@ -405,6 +406,8 @@ void Application::run() {
  		showOpenGLCrashNotification();
  	}
  
@@ -98,10 +98,10 @@ index de4b20765a..08b39ffd3e 100644
  		if (_mediaView) {
 diff --git a/Telegram/SourceFiles/core/sovagram_updater.cpp b/Telegram/SourceFiles/core/sovagram_updater.cpp
 new file mode 100644
-index 0000000000..1dceec4e38
+index 0000000000..05164be076
 --- /dev/null
 +++ b/Telegram/SourceFiles/core/sovagram_updater.cpp
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,147 @@
 +/*
 +This file is part of Sovagram, a fork of Telegram Desktop.
 +Licensed under GPLv3. See LEGAL for the original Telegram Desktop
@@ -161,10 +161,9 @@ index 0000000000..1dceec4e38
 +	}
 +	window->show(Ui::MakeConfirmBox({
 +		.text = tr::lng_sovagram_update_body(
-+			tr::now,
 +			lt_tag,
 +			rpl::single(TextWithEntities{ tag }),
-+			Ui::Text::RichLangValue),
++			tr::rich),
 +		.confirmed = [=](Fn<void()> close) {
 +			File::OpenUrl(downloadUrl);
 +			close();
