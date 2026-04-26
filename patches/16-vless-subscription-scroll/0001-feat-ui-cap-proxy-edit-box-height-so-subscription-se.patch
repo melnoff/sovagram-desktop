@@ -1,0 +1,39 @@
+From f895d4d9dc9cc6d69be1237dabec0502ef19cee0 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sun, 26 Apr 2026 16:30:18 +0300
+Subject: [PATCH] feat(ui): cap proxy edit box height so subscription server
+ list scrolls
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 16 — replaces setDimensionsToContent on the proxy edit box
+with a heightValue-driven setDimensions(width, qMin(h, 600)). The
+internal Ui::BoxContent scroll area kicks in once content exceeds
+600px so subscriptions with many server checkboxes are scrollable
+instead of pushing the box past the screen.
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index deb4648530..a0ce5d3d7a 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -1200,7 +1200,12 @@ void ProxyBox::prepare() {
+ 	connect(_secret.data(), &Ui::MaskedInputField::submitted, submit);
+ 
+ 	refreshButtons();
+-	setDimensionsToContent(st::boxWideWidth, _content);
++	const auto kMaxBoxHeight = 600;
++	_content->resizeToWidth(st::boxWideWidth);
++	_content->heightValue(
++	) | rpl::on_next([=](int h) {
++		setDimensions(st::boxWideWidth, qMin(h, kMaxBoxHeight));
++	}, lifetime());
+ }
+ 
+ void ProxyBox::refreshButtons() {
+-- 
+2.54.0.windows.1
+
