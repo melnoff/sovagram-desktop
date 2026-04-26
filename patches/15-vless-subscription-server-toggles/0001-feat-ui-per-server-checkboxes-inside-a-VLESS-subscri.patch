@@ -1,4 +1,4 @@
-From f6f0fd7eb429653783c542add2b7e9845649803a Mon Sep 17 00:00:00 2001
+From 7a6c655e49838d708ff15670cc268db6130744b4 Mon Sep 17 00:00:00 2001
 From: melnoff <melnoff360@gmail.com>
 Date: Sun, 26 Apr 2026 15:03:19 +0300
 Subject: [PATCH] feat(ui): per-server checkboxes inside a VLESS subscription
@@ -33,14 +33,14 @@ instead of always using all of them.
     "active: <server-name>" / "sidecar running, 9/12 enabled" /
     "9/12 server(s) enabled" / "(no cache — open & refresh)".
 ---
- Telegram/SourceFiles/boxes/connection_box.cpp | 113 +++++++++++++-----
+ Telegram/SourceFiles/boxes/connection_box.cpp | 115 +++++++++++++-----
  .../mtproto/mtproto_proxy_data.cpp            |   8 +-
  .../mtproto/proxy/subscription_cache.cpp      |  95 +++++++++++----
  .../mtproto/proxy/subscription_cache.h        |  29 +++--
- 4 files changed, 177 insertions(+), 68 deletions(-)
+ 4 files changed, 178 insertions(+), 69 deletions(-)
 
 diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
-index 3dd3290c53..697a20794a 100644
+index 3dd3290c53..deb4648530 100644
 --- a/Telegram/SourceFiles/boxes/connection_box.cpp
 +++ b/Telegram/SourceFiles/boxes/connection_box.cpp
 @@ -440,6 +440,7 @@ private:
@@ -195,6 +195,15 @@ index 3dd3290c53..697a20794a 100644
  }
  
  void ProxyBox::renderSubscriptionSidecarStatus() {
+@@ -1714,7 +1757,7 @@ void ProxyBox::renderSubscriptionSidecarStatus() {
+ }
+ 
+ void ProxyBox::refreshSubscription() {
+-	if (!_subUrl || !_subStatus || !_subServersLabel) {
++	if (!_subUrl || !_subStatus || !_subServersInner) {
+ 		return;
+ 	}
+ 	const auto url = _subUrl->getLastText().trimmed();
 @@ -2559,22 +2602,28 @@ void ProxiesBoxController::updateView(const Item &item) {
  	if (item.data.type == Type::VlessSubscription) {
  		const auto cache = MTP::Proxy::SubscriptionCache::instance()
