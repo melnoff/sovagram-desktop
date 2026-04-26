@@ -1,0 +1,566 @@
+From 4b7c3af1fc886c8fbef9f5176dd62126dfac9138 Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sun, 26 Apr 2026 14:46:18 +0300
+Subject: [PATCH] feat(ui): subscription sidecar visibility + manual stop/apply
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 14 — addresses 'no idea what subscription proxy is doing' by
+splitting the workflow into observable steps and surfacing sidecar
+state both in the edit dialog and in the proxy list row.
+
+  * VlessBridge: socksEndpointForSubscription(key) accessor returning
+    the local SOCKS5 endpoint of a running subscription sidecar.
+  * SubscriptionMonitor gains a sidecarRunning flag (true on actual
+    Clash poll, false on idle sentinels) and an endpoint() getter.
+  * SubscriptionMonitorRegistry (new) — process-wide singleton
+    keyed by subscription URL. Hands out an rpl producer per URL
+    that fires status updates whenever the monitor polls or when
+    sidecar state changes. notifySidecarChanged() is called from
+    the dialog's Stop / Apply buttons so subscribers see "now idle"
+    without polling delay.
+  * ProxyBox edit dialog:
+    - 'Refresh subscription' now only fetches + caches; it no longer
+      kills the running sidecar so an active connection is preserved.
+    - New 'Apply (restart sidecar)' button — explicit way to push
+      a freshly fetched server list to a live sidecar (stops it,
+      next forUse() restarts with the new outbounds).
+    - New 'Stop sidecar' button for forced shutdown when something
+      is wrong.
+    - New 'Sidecar: idle / running on 127.0.0.1:NNN · active: vN /
+      clash error: ...' status line.
+    - On dialog open with an empty cache, auto-fires Refresh so
+      the user sees servers without an extra click.
+    - Per-dialog SubscriptionMonitor replaced by registry subscription;
+      multiple consumers of the same URL now share a single poller.
+  * ProxiesBoxController: subscribes per VlessSubscription item to
+    the registry, caches sidecarRunning + activeTag + error on the
+    Item, and rewrites the row label so the second line reads
+    'active: <server-name>' / 'sidecar running, N server(s)' /
+    'N server(s) cached' / '(no cache — open & refresh)' instead of
+    the unreadable subscription URL.
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 154 +++++++++++++++---
+ Telegram/SourceFiles/boxes/connection_box.h   |   5 +
+ .../mtproto/proxy/subscription_monitor.cpp    |  84 +++++++++-
+ .../mtproto/proxy/subscription_monitor.h      |  39 ++++-
+ .../mtproto/proxy/vless_bridge.cpp            |  13 ++
+ .../SourceFiles/mtproto/proxy/vless_bridge.h  |  11 ++
+ 6 files changed, 272 insertions(+), 34 deletions(-)
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index 4dba9198ab..3dd3290c53 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -435,9 +435,11 @@ private:
+ 	void syncVlessFromUrl();
+ 	void syncVlessFromFields();
+ 	void refreshSubscription();
++	void applySubscription();
++	void stopSubscriptionSidecar();
+ 	void renderSubscriptionEntry(
+ 		const MTP::Proxy::SubscriptionEntry &entry);
+-	void startSubscriptionMonitorIfRunning(const QString &subscriptionUrl);
++	void renderSubscriptionSidecarStatus();
+ 
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+@@ -484,11 +486,13 @@ private:
+ 	QPointer<Ui::SlideWrap<Ui::VerticalLayout>> _vlessSubscriptionCredentials;
+ 	QPointer<Ui::InputField> _subUrl;
+ 	QPointer<Ui::FlatLabel> _subStatus;
++	QPointer<Ui::FlatLabel> _subSidecarStatus;
+ 	QPointer<Ui::FlatLabel> _subServersLabel;
+ 	std::unique_ptr<MTP::Proxy::SubscriptionFetcher> _subFetcher;
+-	std::unique_ptr<MTP::Proxy::SubscriptionMonitor> _subMonitor;
++	rpl::lifetime _subMonitorLife;
+ 	MTP::Proxy::SubscriptionMonitorStatus _subMonitorStatus;
+ 	MTP::Proxy::SubscriptionEntry _subEntry;
++	QString _subUrlInUse; // url currently subscribed in registry
+ 
+ };
+ 
+@@ -1580,10 +1584,24 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 	const auto refreshBtn = inner->add(
+ 		object_ptr<Ui::LinkButton>(
+ 			inner,
+-			QStringLiteral("Refresh now")),
++			QStringLiteral("Refresh subscription")),
+ 		st::proxyEditInputPadding);
+ 	refreshBtn->setClickedCallback([=] { refreshSubscription(); });
+ 
++	const auto applyBtn = inner->add(
++		object_ptr<Ui::LinkButton>(
++			inner,
++			QStringLiteral("Apply (restart sidecar)")),
++		st::proxyEditInputPadding);
++	applyBtn->setClickedCallback([=] { applySubscription(); });
++
++	const auto stopBtn = inner->add(
++		object_ptr<Ui::LinkButton>(
++			inner,
++			QStringLiteral("Stop sidecar")),
++		st::proxyEditInputPadding);
++	stopBtn->setClickedCallback([=] { stopSubscriptionSidecar(); });
++
+ 	_subStatus = inner->add(
+ 		object_ptr<Ui::FlatLabel>(
+ 			inner,
+@@ -1591,18 +1609,36 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 			st::boxLabel),
+ 		st::proxyEditInputPadding + QMargins(0, 6, 0, 0));
+ 
++	_subSidecarStatus = inner->add(
++		object_ptr<Ui::FlatLabel>(
++			inner,
++			QStringLiteral("Sidecar: idle"),
++			st::boxLabel),
++		st::proxyEditInputPadding + QMargins(0, 2, 0, 0));
++
+ 	_subServersLabel = inner->add(
+ 		object_ptr<Ui::FlatLabel>(
+ 			inner,
+-			QStringLiteral("Click 'Refresh now' to load servers."),
++			QStringLiteral("Click 'Refresh subscription' to load servers."),
+ 			st::boxLabel),
+ 		st::proxyEditInputPadding + QMargins(0, 4, 0, 8));
+ 
+ 	if (data.type == Type::VlessSubscription && !data.host.isEmpty()) {
++		_subUrlInUse = data.host;
+ 		_subEntry = MTP::Proxy::SubscriptionCache::instance()
+ 			.entry(data.host);
+ 		renderSubscriptionEntry(_subEntry);
+-		startSubscriptionMonitorIfRunning(data.host);
++		MTP::Proxy::SubscriptionMonitorRegistry::instance().status(
++			data.host
++		) | rpl::on_next([=](MTP::Proxy::SubscriptionMonitorStatus status) {
++			_subMonitorStatus = std::move(status);
++			renderSubscriptionEntry(_subEntry);
++			renderSubscriptionSidecarStatus();
++		}, _subMonitorLife);
++		renderSubscriptionSidecarStatus();
++		if (_subEntry.empty()) {
++			refreshSubscription();
++		}
+ 	}
+ }
+ 
+@@ -1656,23 +1692,25 @@ void ProxyBox::renderSubscriptionEntry(
+ 	_subServersLabel->setText(lines.join(QChar(u'\n')));
+ }
+ 
+-void ProxyBox::startSubscriptionMonitorIfRunning(
+-		const QString &subscriptionUrl) {
+-	const auto endpoint = MTP::Proxy::VlessBridge::instance()
+-		.clashEndpointForSubscription(subscriptionUrl);
+-	if (!endpoint) {
+-		_subMonitor.reset();
++void ProxyBox::renderSubscriptionSidecarStatus() {
++	if (!_subSidecarStatus) {
+ 		return;
+ 	}
+-	_subMonitor = std::make_unique<MTP::Proxy::SubscriptionMonitor>(
+-		endpoint->endpoint,
+-		endpoint->secret);
+-	_subMonitor->status(
+-	) | rpl::on_next([=](MTP::Proxy::SubscriptionMonitorStatus status) {
+-		_subMonitorStatus = std::move(status);
+-		renderSubscriptionEntry(_subEntry);
+-	}, lifetime());
+-	_subMonitor->start();
++	const auto socks = MTP::Proxy::VlessBridge::instance()
++		.socksEndpointForSubscription(_subUrlInUse);
++	if (!socks) {
++		_subSidecarStatus->setText(QStringLiteral("Sidecar: idle"));
++		return;
++	}
++	auto line = QStringLiteral("Sidecar: running on %1:%2")
++		.arg(socks->host)
++		.arg(socks->port);
++	if (!_subMonitorStatus.error.isEmpty()) {
++		line += QStringLiteral(" · clash error: ") + _subMonitorStatus.error;
++	} else if (!_subMonitorStatus.activeTag.isEmpty()) {
++		line += QStringLiteral(" · active: ") + _subMonitorStatus.activeTag;
++	}
++	_subSidecarStatus->setText(line);
+ }
+ 
+ void ProxyBox::refreshSubscription() {
+@@ -1696,9 +1734,6 @@ void ProxyBox::refreshSubscription() {
+ 			MTP::Proxy::SubscriptionCache::instance().setServers(
+ 				url,
+ 				result.servers);
+-			MTP::Proxy::VlessBridge::instance().stopSubscription(url);
+-			_subMonitor.reset();
+-			_subMonitorStatus = {};
+ 			_subEntry = MTP::Proxy::SubscriptionCache::instance()
+ 				.entry(url);
+ 			renderSubscriptionEntry(_subEntry);
+@@ -1708,6 +1743,30 @@ void ProxyBox::refreshSubscription() {
+ 	_subFetcher->fetch(url);
+ }
+ 
++void ProxyBox::applySubscription() {
++	if (!_subUrl) return;
++	const auto url = _subUrl->getLastText().trimmed();
++	if (url.isEmpty()) return;
++	MTP::Proxy::VlessBridge::instance().stopSubscription(url);
++	MTP::Proxy::SubscriptionMonitorRegistry::instance().notifySidecarChanged(
++		url);
++	_subMonitorStatus = {};
++	renderSubscriptionEntry(_subEntry);
++	renderSubscriptionSidecarStatus();
++}
++
++void ProxyBox::stopSubscriptionSidecar() {
++	if (!_subUrl) return;
++	const auto url = _subUrl->getLastText().trimmed();
++	if (url.isEmpty()) return;
++	MTP::Proxy::VlessBridge::instance().stopSubscription(url);
++	MTP::Proxy::SubscriptionMonitorRegistry::instance().notifySidecarChanged(
++		url);
++	_subMonitorStatus = {};
++	renderSubscriptionEntry(_subEntry);
++	renderSubscriptionSidecarStatus();
++}
++
+ void ProxyBox::setupControls(const ProxyData &data) {
+ 	_type = std::make_shared<Ui::RadioenumGroup<Type>>(
+ 		(data.type == Type::None
+@@ -2162,6 +2221,28 @@ void ProxiesBoxController::refreshChecker(Item &item) {
+ 	if (!HasProxyCheckers(item.checker, item.checkerv6)) {
+ 		item.state = ItemState::Unavailable;
+ 	}
++
++	item.subscriptionMonitorLife.destroy();
++	item.subscriptionActiveTag.clear();
++	item.subscriptionMonitorError.clear();
++	item.subscriptionSidecarRunning = false;
++	if (item.data.type == Type::VlessSubscription) {
++		MTP::Proxy::SubscriptionMonitorRegistry::instance().status(
++			item.data.host
++		) | rpl::on_next([=](MTP::Proxy::SubscriptionMonitorStatus status) {
++			const auto it = ranges::find(
++				_list,
++				id,
++				[](const Item &item) { return item.id; });
++			if (it == end(_list)) {
++				return;
++			}
++			it->subscriptionSidecarRunning = status.sidecarRunning;
++			it->subscriptionActiveTag = status.activeTag;
++			it->subscriptionMonitorError = status.error;
++			updateView(*it);
++		}, item.subscriptionMonitorLife);
++	}
+ }
+ 
+ object_ptr<Ui::BoxContent> ProxiesBoxController::CreateOwningBox(
+@@ -2474,10 +2555,35 @@ void ProxiesBoxController::updateView(const Item &item) {
+ 	const auto supportsShare = (item.data.type == Type::Socks5)
+ 		|| (item.data.type == Type::Mtproto);
+ 	const auto supportsCalls = item.data.supportsCalls();
++	auto displayHost = item.data.host;
++	if (item.data.type == Type::VlessSubscription) {
++		const auto cache = MTP::Proxy::SubscriptionCache::instance()
++			.entry(item.data.host);
++		if (item.subscriptionSidecarRunning
++				&& !item.subscriptionActiveTag.isEmpty()) {
++			auto active = item.subscriptionActiveTag;
++			if (active.startsWith(u"v"_q)) {
++				const auto idx = active.mid(1).toInt();
++				if (idx >= 0 && idx < cache.servers.size()) {
++					const auto &p = cache.servers[idx];
++					active = p.name.isEmpty() ? p.server : p.name;
++				}
++			}
++			displayHost = QStringLiteral("active: %1").arg(active);
++		} else if (item.subscriptionSidecarRunning) {
++			displayHost = QStringLiteral("sidecar running, %1 server(s)")
++				.arg(cache.servers.size());
++		} else if (!cache.empty()) {
++			displayHost = QStringLiteral("%1 server(s) cached")
++				.arg(cache.servers.size());
++		} else {
++			displayHost = QStringLiteral("(no cache — open & refresh)");
++		}
++	}
+ 	_views.fire({
+ 		item.id,
+ 		type,
+-		item.data.host,
++		displayHost,
+ 		item.data.port,
+ 		item.ping,
+ 		!deleted && selected,
+diff --git a/Telegram/SourceFiles/boxes/connection_box.h b/Telegram/SourceFiles/boxes/connection_box.h
+index c33f8ea0f4..b4d46caeac 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.h
++++ b/Telegram/SourceFiles/boxes/connection_box.h
+@@ -108,6 +108,11 @@ private:
+ 		ItemState state = ItemState::Checking;
+ 		int ping = 0;
+ 
++		QString subscriptionActiveTag;
++		QString subscriptionMonitorError;
++		bool subscriptionSidecarRunning = false;
++		rpl::lifetime subscriptionMonitorLife;
++
+ 	};
+ 
+ 	std::vector<Item>::iterator findById(int id);
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
+index e34f4fb352..4df28a57fb 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "mtproto/proxy/subscription_monitor.h"
+ 
++#include "mtproto/proxy/vless_bridge.h"
+ #include "logs.h"
+ 
+ #include <QtCore/QJsonArray>
+@@ -81,22 +82,26 @@ void SubscriptionMonitor::handleReply(QNetworkReply *reply) {
+ 	}
+ 	_current = nullptr;
+ 
++	SubscriptionMonitorStatus out;
++	out.sidecarRunning = true;
++
+ 	if (reply->error() != QNetworkReply::NoError) {
+-		_status.fire({ {}, reply->errorString(), {} });
++		out.error = reply->errorString();
++		_status.fire(std::move(out));
+ 		return;
+ 	}
+ 	const auto doc = QJsonDocument::fromJson(reply->readAll());
+ 	if (!doc.isObject()) {
+-		_status.fire({ {}, QStringLiteral("Bad Clash API response."), {} });
++		out.error = QStringLiteral("Bad Clash API response.");
++		_status.fire(std::move(out));
+ 		return;
+ 	}
+ 	const auto proxies = doc.object().value(u"proxies"_q).toObject();
+ 	const auto selector = proxies.value(u"proxy"_q).toObject();
+-	const auto activeTag = selector.value(u"now"_q).toString();
++	out.activeTag = selector.value(u"now"_q).toString();
+ 	const auto allTags = selector.value(u"all"_q).toArray();
+ 
+-	QList<SubscriptionServerStatus> servers;
+-	servers.reserve(allTags.size());
++	out.servers.reserve(allTags.size());
+ 	for (const auto &t : allTags) {
+ 		const auto tag = t.toString();
+ 		if (tag.isEmpty()) {
+@@ -109,13 +114,78 @@ void SubscriptionMonitor::handleReply(QNetworkReply *reply) {
+ 			const auto last = history.last().toObject();
+ 			delayMs = last.value(u"delay"_q).toInt(-1);
+ 		}
+-		servers.append({ tag, delayMs });
++		out.servers.append({ tag, delayMs });
+ 	}
+-	_status.fire({ activeTag, QString(), std::move(servers) });
++	_status.fire(std::move(out));
+ }
+ 
+ rpl::producer<SubscriptionMonitorStatus> SubscriptionMonitor::status() {
+ 	return _status.events();
+ }
+ 
++SubscriptionMonitorRegistry &SubscriptionMonitorRegistry::instance() {
++	static SubscriptionMonitorRegistry v;
++	return v;
++}
++
++SubscriptionMonitorRegistry::Entry &SubscriptionMonitorRegistry::ensureEntry(
++		const QString &url) {
++	auto it = _entries.find(url);
++	if (it != _entries.end()) {
++		return *it->second;
++	}
++	auto entry = std::make_unique<Entry>();
++	auto &ref = *entry;
++	_entries.emplace(url, std::move(entry));
++	return ref;
++}
++
++void SubscriptionMonitorRegistry::rebuildMonitor(const QString &url) {
++	auto endpoint = VlessBridge::instance().clashEndpointForSubscription(url);
++	auto it = _entries.find(url);
++	if (it == _entries.end()) {
++		return;
++	}
++	auto &entry = *it->second;
++
++	if (!endpoint) {
++		if (entry.monitor) {
++			entry.monitor.reset();
++			entry.monitorLifetime.destroy();
++			entry.stream.fire({}); // sidecarRunning = false
++		}
++		return;
++	}
++	if (entry.monitor && entry.monitor->endpoint() == endpoint->endpoint) {
++		return; // already running for this endpoint
++	}
++	entry.monitorLifetime.destroy();
++	entry.monitor = std::make_unique<SubscriptionMonitor>(
++		endpoint->endpoint,
++		endpoint->secret);
++	entry.monitor->status(
++	) | rpl::on_next([this, url](SubscriptionMonitorStatus s) {
++		auto it = _entries.find(url);
++		if (it != _entries.end()) {
++			it->second->stream.fire(std::move(s));
++		}
++	}, entry.monitorLifetime);
++	entry.monitor->start();
++}
++
++rpl::producer<SubscriptionMonitorStatus> SubscriptionMonitorRegistry::status(
++		const QString &subscriptionUrl) {
++	auto &entry = ensureEntry(subscriptionUrl);
++	rebuildMonitor(subscriptionUrl);
++	return entry.stream.events();
++}
++
++void SubscriptionMonitorRegistry::notifySidecarChanged(
++		const QString &subscriptionUrl) {
++	if (_entries.find(subscriptionUrl) == _entries.end()) {
++		return; // nobody listening
++	}
++	rebuildMonitor(subscriptionUrl);
++}
++
+ } // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
+index bcc85723f8..ea4fe176b8 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
+@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #pragma once
+ 
++#include "base/flat_map.h"
++
+ #include <QtCore/QObject>
+ #include <QtCore/QPointer>
+ #include <QtCore/QTimer>
+@@ -22,15 +24,15 @@ struct SubscriptionServerStatus {
+ };
+ 
+ struct SubscriptionMonitorStatus {
+-	QString activeTag;                       // currently selected by urltest
++	bool sidecarRunning = false;             // false → idle, ignore other fields
++	QString activeTag;                       // selected by urltest
+ 	QString error;                           // empty on success
+ 	QList<SubscriptionServerStatus> servers; // one entry per "vN" tag
+ };
+ 
+ // Polls a sing-box Clash API endpoint every few seconds and emits which
+ // outbound the urltest selector currently considers active plus the last
+-// delay measurement for every server in the subscription. Owned per
+-// edit-dialog instance — destroying the monitor stops the timer.
++// delay measurement for every server in the subscription.
+ class SubscriptionMonitor final : public QObject {
+ public:
+ 	SubscriptionMonitor(
+@@ -42,6 +44,7 @@ public:
+ 	void start();
+ 	void stop();
+ 
++	[[nodiscard]] const QString &endpoint() const { return _endpoint; }
+ 	[[nodiscard]] rpl::producer<SubscriptionMonitorStatus> status();
+ 
+ private:
+@@ -56,4 +59,34 @@ private:
+ 	rpl::event_stream<SubscriptionMonitorStatus> _status;
+ };
+ 
++// Process-wide registry of subscription monitors. Hands out a single rpl
++// producer per subscription URL that emits status updates whenever the
++// sidecar polls or whenever sidecar state changes (start/stop).
++//
++// VlessBridge calls notifySidecarChanged() after ensureRunningSubscription /
++// stopSubscription so subscribers see "now connected" / "now idle" promptly.
++class SubscriptionMonitorRegistry final {
++public:
++	static SubscriptionMonitorRegistry &instance();
++
++	[[nodiscard]] rpl::producer<SubscriptionMonitorStatus> status(
++		const QString &subscriptionUrl);
++
++	void notifySidecarChanged(const QString &subscriptionUrl);
++
++private:
++	SubscriptionMonitorRegistry() = default;
++
++	struct Entry {
++		std::unique_ptr<SubscriptionMonitor> monitor;
++		rpl::event_stream<SubscriptionMonitorStatus> stream;
++		rpl::lifetime monitorLifetime;
++	};
++
++	[[nodiscard]] Entry &ensureEntry(const QString &url);
++	void rebuildMonitor(const QString &url);
++
++	base::flat_map<QString, std::unique_ptr<Entry>> _entries;
++};
++
+ } // namespace MTP::Proxy
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+index e986edd211..df8eca3ee1 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.cpp
+@@ -123,6 +123,19 @@ VlessBridge::clashEndpointForSubscription(const QString &subscriptionKey) {
+ 	};
+ }
+ 
++std::optional<VlessBridge::SocksEndpoint>
++VlessBridge::socksEndpointForSubscription(const QString &subscriptionKey) {
++	QMutexLocker lock(&_mu);
++	const auto it = _runningSubscriptions.find(subscriptionKey);
++	if (it == _runningSubscriptions.end()) {
++		return std::nullopt;
++	}
++	return SocksEndpoint{
++		.host = QStringLiteral("127.0.0.1"),
++		.port = it->second.port,
++	};
++}
++
+ ProxyData VlessBridge::ensureRunning(const ProxyData &vlessProxy) {
+ 	Expects(vlessProxy.type == ProxyData::Type::Vless);
+ 
+diff --git a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+index 83c55afc1f..e7738f6a41 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
++++ b/Telegram/SourceFiles/mtproto/proxy/vless_bridge.h
+@@ -52,11 +52,22 @@ public:
+ 		QString secret;
+ 	};
+ 
++	struct SocksEndpoint {
++		QString host;
++		quint16 port = 0;
++	};
++
+ 	// Returns the Clash API endpoint + secret for a running subscription
+ 	// sidecar, or std::nullopt if no sidecar is running for this key.
+ 	[[nodiscard]] std::optional<ClashEndpoint> clashEndpointForSubscription(
+ 		const QString &subscriptionKey);
+ 
++	// Returns the local SOCKS5 endpoint of a running subscription sidecar,
++	// or std::nullopt if no sidecar is running for this key. Useful for the
++	// edit dialog status line.
++	[[nodiscard]] std::optional<SocksEndpoint> socksEndpointForSubscription(
++		const QString &subscriptionKey);
++
+ private:
+ 	VlessBridge();
+ 	~VlessBridge();
+-- 
+2.54.0.windows.1
+

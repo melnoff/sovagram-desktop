@@ -1,0 +1,454 @@
+From f6f0fd7eb429653783c542add2b7e9845649803a Mon Sep 17 00:00:00 2001
+From: melnoff <melnoff360@gmail.com>
+Date: Sun, 26 Apr 2026 15:03:19 +0300
+Subject: [PATCH] feat(ui): per-server checkboxes inside a VLESS subscription
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 15 — lets the user pick which servers from a fetched
+subscription should actually feed the sing-box urltest selector,
+instead of always using all of them.
+
+  * SubscriptionCache: SubscriptionServer { params, enabled } replaces
+    the bare VlessParams in entries; SubscriptionEntry::enabledParams()
+    returns only the enabled subset. JSON schema for each entry now
+    stores [{ "url": "vless://...", "enabled": true }, ...]; legacy
+    flat string lists still load (everything defaults to enabled).
+    setServers() preserves the per-server enabled flag for vless URLs
+    that survive a re-fetch and defaults brand-new ones to enabled.
+    New setServerEnabled(url, index, bool) for in-place toggles.
+  * ProxyData::forUse() for Type::VlessSubscription now hands
+    enabledParams() to the bridge — disabled servers are excluded
+    from the urltest config.
+  * ProxyBox edit dialog: replaces the FlatLabel server list with
+    a Ui::VerticalLayout of per-server Ui::Checkbox widgets, rebuilt
+    on cache change. Each checkbox shows
+    "1. server-de  45ms  ← active" and toggling it persists the
+    new enabled flag immediately. Status header reads
+    "12 server(s), 9 enabled — refreshed YYYY-MM-DD HH:MM ·
+    click Apply to use changes" so the user knows toggles only take
+    effect on the next sidecar restart.
+  * ProxiesBoxController row label now reads
+    "active: <server-name>" / "sidecar running, 9/12 enabled" /
+    "9/12 server(s) enabled" / "(no cache — open & refresh)".
+---
+ Telegram/SourceFiles/boxes/connection_box.cpp | 113 +++++++++++++-----
+ .../mtproto/mtproto_proxy_data.cpp            |   8 +-
+ .../mtproto/proxy/subscription_cache.cpp      |  95 +++++++++++----
+ .../mtproto/proxy/subscription_cache.h        |  29 +++--
+ 4 files changed, 177 insertions(+), 68 deletions(-)
+
+diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
+index 3dd3290c53..697a20794a 100644
+--- a/Telegram/SourceFiles/boxes/connection_box.cpp
++++ b/Telegram/SourceFiles/boxes/connection_box.cpp
+@@ -440,6 +440,7 @@ private:
+ 	void renderSubscriptionEntry(
+ 		const MTP::Proxy::SubscriptionEntry &entry);
+ 	void renderSubscriptionSidecarStatus();
++	void rebuildSubscriptionCheckboxes();
+ 
+ 	void addLabel(
+ 		not_null<Ui::VerticalLayout*> parent,
+@@ -487,7 +488,8 @@ private:
+ 	QPointer<Ui::InputField> _subUrl;
+ 	QPointer<Ui::FlatLabel> _subStatus;
+ 	QPointer<Ui::FlatLabel> _subSidecarStatus;
+-	QPointer<Ui::FlatLabel> _subServersLabel;
++	QPointer<Ui::VerticalLayout> _subServersInner;
++	QList<QPointer<Ui::Checkbox>> _subCheckboxes;
+ 	std::unique_ptr<MTP::Proxy::SubscriptionFetcher> _subFetcher;
+ 	rpl::lifetime _subMonitorLife;
+ 	MTP::Proxy::SubscriptionMonitorStatus _subMonitorStatus;
+@@ -1616,11 +1618,8 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 			st::boxLabel),
+ 		st::proxyEditInputPadding + QMargins(0, 2, 0, 0));
+ 
+-	_subServersLabel = inner->add(
+-		object_ptr<Ui::FlatLabel>(
+-			inner,
+-			QStringLiteral("Click 'Refresh subscription' to load servers."),
+-			st::boxLabel),
++	_subServersInner = inner->add(
++		object_ptr<Ui::VerticalLayout>(inner),
+ 		st::proxyEditInputPadding + QMargins(0, 4, 0, 8));
+ 
+ 	if (data.type == Type::VlessSubscription && !data.host.isEmpty()) {
+@@ -1644,52 +1643,96 @@ void ProxyBox::setupVlessSubscriptionCredentials(const ProxyData &data) {
+ 
+ void ProxyBox::renderSubscriptionEntry(
+ 		const MTP::Proxy::SubscriptionEntry &entry) {
+-	if (!_subStatus || !_subServersLabel) {
++	if (!_subStatus) {
+ 		return;
+ 	}
+ 	if (entry.empty()) {
++		_subStatus->setText(QStringLiteral("(no cache)"));
++		rebuildSubscriptionCheckboxes();
+ 		return;
+ 	}
+ 	const auto stamp = entry.fetchedAt.isValid()
+ 		? entry.fetchedAt.toString(u"yyyy-MM-dd HH:mm"_q)
+ 		: QStringLiteral("(unknown)");
+-	auto header = QStringLiteral("%1 server(s) — refreshed %2")
++	auto enabledCount = 0;
++	for (const auto &s : entry.servers) {
++		if (s.enabled) ++enabledCount;
++	}
++	_subStatus->setText(QStringLiteral(
++		"%1 server(s), %2 enabled — refreshed %3")
+ 		.arg(entry.servers.size())
+-		.arg(stamp);
+-	if (!_subMonitorStatus.error.isEmpty()) {
+-		header += QStringLiteral(" · monitor: ") + _subMonitorStatus.error;
+-	} else if (!_subMonitorStatus.activeTag.isEmpty()) {
+-		header += QStringLiteral(" · active: ")
+-			+ _subMonitorStatus.activeTag;
++		.arg(enabledCount)
++		.arg(stamp));
++	rebuildSubscriptionCheckboxes();
++}
++
++void ProxyBox::rebuildSubscriptionCheckboxes() {
++	if (!_subServersInner) {
++		return;
+ 	}
+-	_subStatus->setText(header);
++	for (const auto &cb : _subCheckboxes) {
++		if (cb) {
++			cb->deleteLater();
++		}
++	}
++	_subCheckboxes.clear();
+ 
+ 	QHash<QString, int> delayByTag;
+ 	for (const auto &s : _subMonitorStatus.servers) {
+ 		delayByTag.insert(s.tag, s.delayMs);
+ 	}
+-
+-	const auto width = QString::number(entry.servers.size()).size();
+-	QStringList lines;
+-	lines.reserve(entry.servers.size());
+-	for (int i = 0; i != entry.servers.size(); ++i) {
+-		const auto &p = entry.servers[i];
+-		const auto label = p.name.isEmpty() ? p.server : p.name;
++	const auto width = QString::number(_subEntry.servers.size()).size();
++	for (int i = 0; i != _subEntry.servers.size(); ++i) {
++		const auto &s = _subEntry.servers[i];
++		const auto label = s.params.name.isEmpty()
++			? s.params.server
++			: s.params.name;
+ 		const auto idx = QString::number(i + 1).rightJustified(width, u' ');
+ 		const auto tag = QStringLiteral("v%1").arg(i);
+ 		const auto active = (_subMonitorStatus.activeTag == tag);
+-		auto line = QStringLiteral("%1 %2. %3")
+-			.arg(active ? u"→"_q : u" "_q)
+-			.arg(idx, label);
++		auto text = QStringLiteral("%1. %2").arg(idx, label);
+ 		const auto it = delayByTag.find(tag);
+ 		if (it != delayByTag.end() && it.value() >= 0) {
+-			line += QStringLiteral("  %1ms").arg(it.value());
++			text += QStringLiteral("  %1ms").arg(it.value());
+ 		} else if (it != delayByTag.end()) {
+-			line += QStringLiteral("  timeout");
++			text += QStringLiteral("  timeout");
+ 		}
+-		lines.append(line);
++		if (active) {
++			text += QStringLiteral("  ← active");
++		}
++		const auto cb = _subServersInner->add(
++			object_ptr<Ui::Checkbox>(
++				_subServersInner,
++				text,
++				s.enabled,
++				st::defaultBoxCheckbox),
++			QMargins(0, 2, 0, 2));
++		const auto url = _subUrlInUse;
++		const auto index = i;
++		cb->checkedChanges() | rpl::on_next([=](bool checked) {
++			MTP::Proxy::SubscriptionCache::instance().setServerEnabled(
++				url,
++				index,
++				checked);
++			_subEntry = MTP::Proxy::SubscriptionCache::instance().entry(url);
++			if (_subStatus) {
++				auto enabled = 0;
++				for (const auto &s : _subEntry.servers) {
++					if (s.enabled) ++enabled;
++				}
++				const auto stamp = _subEntry.fetchedAt.isValid()
++					? _subEntry.fetchedAt.toString(u"yyyy-MM-dd HH:mm"_q)
++					: QStringLiteral("(unknown)");
++				_subStatus->setText(QStringLiteral(
++					"%1 server(s), %2 enabled — refreshed %3 · "
++					"click Apply to use changes")
++					.arg(_subEntry.servers.size())
++					.arg(enabled)
++					.arg(stamp));
++			}
++		}, cb->lifetime());
++		_subCheckboxes.append(cb);
+ 	}
+-	_subServersLabel->setText(lines.join(QChar(u'\n')));
+ }
+ 
+ void ProxyBox::renderSubscriptionSidecarStatus() {
+@@ -2559,22 +2602,28 @@ void ProxiesBoxController::updateView(const Item &item) {
+ 	if (item.data.type == Type::VlessSubscription) {
+ 		const auto cache = MTP::Proxy::SubscriptionCache::instance()
+ 			.entry(item.data.host);
++		auto enabled = 0;
++		for (const auto &s : cache.servers) {
++			if (s.enabled) ++enabled;
++		}
+ 		if (item.subscriptionSidecarRunning
+ 				&& !item.subscriptionActiveTag.isEmpty()) {
+ 			auto active = item.subscriptionActiveTag;
+ 			if (active.startsWith(u"v"_q)) {
+ 				const auto idx = active.mid(1).toInt();
+ 				if (idx >= 0 && idx < cache.servers.size()) {
+-					const auto &p = cache.servers[idx];
++					const auto &p = cache.servers[idx].params;
+ 					active = p.name.isEmpty() ? p.server : p.name;
+ 				}
+ 			}
+ 			displayHost = QStringLiteral("active: %1").arg(active);
+ 		} else if (item.subscriptionSidecarRunning) {
+-			displayHost = QStringLiteral("sidecar running, %1 server(s)")
++			displayHost = QStringLiteral("sidecar running, %1/%2 enabled")
++				.arg(enabled)
+ 				.arg(cache.servers.size());
+ 		} else if (!cache.empty()) {
+-			displayHost = QStringLiteral("%1 server(s) cached")
++			displayHost = QStringLiteral("%1/%2 server(s) enabled")
++				.arg(enabled)
+ 				.arg(cache.servers.size());
+ 		} else {
+ 			displayHost = QStringLiteral("(no cache — open & refresh)");
+diff --git a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
+index 2654946b20..e29adb515d 100644
+--- a/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
++++ b/Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp
+@@ -277,14 +277,14 @@ ProxyData ProxyData::forUse() const {
+ 	if (type == Type::Vless) {
+ 		return Proxy::VlessBridge::instance().ensureRunning(*this);
+ 	} else if (type == Type::VlessSubscription) {
+-		const auto servers = Proxy::SubscriptionCache::instance()
+-			.servers(host);
+-		if (servers.isEmpty()) {
++		const auto entry = Proxy::SubscriptionCache::instance().entry(host);
++		const auto enabled = entry.enabledParams();
++		if (enabled.isEmpty()) {
+ 			return {};
+ 		}
+ 		return Proxy::VlessBridge::instance().ensureRunningSubscription(
+ 			host,
+-			servers);
++			enabled);
+ 	}
+ 	return *this;
+ }
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+index 88f9c87a00..8e00219825 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.cpp
+@@ -19,6 +19,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ namespace MTP::Proxy {
+ 
++QList<VlessParams> SubscriptionEntry::enabledParams() const {
++	QList<VlessParams> out;
++	out.reserve(servers.size());
++	for (const auto &s : servers) {
++		if (s.enabled) {
++			out.append(s.params);
++		}
++	}
++	return out;
++}
++
+ SubscriptionCache &SubscriptionCache::instance() {
+ 	static SubscriptionCache v;
+ 	return v;
+@@ -55,11 +66,20 @@ void SubscriptionCache::ensureLoaded() {
+ 	for (auto it = subs.begin(); it != subs.end(); ++it) {
+ 		const auto entryObj = it.value().toObject();
+ 		const auto serversArray = entryObj.value(u"servers"_q).toArray();
+-		QList<VlessParams> servers;
++		QList<SubscriptionServer> servers;
+ 		servers.reserve(serversArray.size());
+ 		for (const auto &v : serversArray) {
+-			if (auto p = ParseVlessUrl(v.toString())) {
+-				servers.append(std::move(*p));
++			QString url;
++			auto enabled = true;
++			if (v.isString()) {
++				url = v.toString();
++			} else if (v.isObject()) {
++				const auto obj = v.toObject();
++				url = obj.value(u"url"_q).toString();
++				enabled = obj.value(u"enabled"_q).toBool(true);
++			}
++			if (auto p = ParseVlessUrl(url)) {
++				servers.append({ std::move(*p), enabled });
+ 			}
+ 		}
+ 		if (servers.isEmpty()) {
+@@ -79,11 +99,15 @@ void SubscriptionCache::persist() {
+ 	QJsonObject subs;
+ 	for (const auto &[url, entry] : _entries) {
+ 		QJsonArray arr;
+-		for (const auto &p : entry.servers) {
+-			const auto built = BuildVlessUrl(p);
+-			if (!built.isEmpty()) {
+-				arr.append(built);
++		for (const auto &s : entry.servers) {
++			const auto built = BuildVlessUrl(s.params);
++			if (built.isEmpty()) {
++				continue;
+ 			}
++			QJsonObject obj;
++			obj[u"url"_q] = built;
++			obj[u"enabled"_q] = s.enabled;
++			arr.append(obj);
+ 		}
+ 		QJsonObject obj;
+ 		obj[u"servers"_q] = arr;
+@@ -106,14 +130,6 @@ void SubscriptionCache::persist() {
+ 	file.close();
+ }
+ 
+-QList<VlessParams> SubscriptionCache::servers(
+-		const QString &subscriptionUrl) {
+-	QMutexLocker lock(&_mu);
+-	ensureLoaded();
+-	const auto it = _entries.find(subscriptionUrl);
+-	return (it == _entries.end()) ? QList<VlessParams>() : it->second.servers;
+-}
+-
+ SubscriptionEntry SubscriptionCache::entry(
+ 		const QString &subscriptionUrl) {
+ 	QMutexLocker lock(&_mu);
+@@ -124,17 +140,52 @@ SubscriptionEntry SubscriptionCache::entry(
+ 
+ void SubscriptionCache::setServers(
+ 		const QString &subscriptionUrl,
+-		const QList<VlessParams> &servers) {
++		const QList<VlessParams> &fetched) {
+ 	QMutexLocker lock(&_mu);
+ 	ensureLoaded();
+-	if (servers.isEmpty()) {
++	if (fetched.isEmpty()) {
+ 		_entries.erase(subscriptionUrl);
+-	} else {
+-		SubscriptionEntry entry;
+-		entry.servers = servers;
+-		entry.fetchedAt = QDateTime::currentDateTime();
+-		_entries[subscriptionUrl] = std::move(entry);
++		persist();
++		return;
++	}
++	const auto previous = _entries.find(subscriptionUrl);
++	QHash<QString, bool> previousEnabled;
++	if (previous != _entries.end()) {
++		for (const auto &s : previous->second.servers) {
++			const auto key = BuildVlessUrl(s.params);
++			if (!key.isEmpty()) {
++				previousEnabled.insert(key, s.enabled);
++			}
++		}
++	}
++	SubscriptionEntry entry;
++	entry.fetchedAt = QDateTime::currentDateTime();
++	entry.servers.reserve(fetched.size());
++	for (const auto &p : fetched) {
++		const auto key = BuildVlessUrl(p);
++		const auto enabled = previousEnabled.value(key, true);
++		entry.servers.append({ p, enabled });
++	}
++	_entries[subscriptionUrl] = std::move(entry);
++	persist();
++}
++
++void SubscriptionCache::setServerEnabled(
++		const QString &subscriptionUrl,
++		int index,
++		bool enabled) {
++	QMutexLocker lock(&_mu);
++	ensureLoaded();
++	const auto it = _entries.find(subscriptionUrl);
++	if (it == _entries.end()
++		|| index < 0
++		|| index >= it->second.servers.size()) {
++		return;
++	}
++	if (it->second.servers[index].enabled == enabled) {
++		return;
+ 	}
++	it->second.servers[index].enabled = enabled;
+ 	persist();
+ }
+ 
+diff --git a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+index 8ef5b28095..a847e44fd4 100644
+--- a/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
++++ b/Telegram/SourceFiles/mtproto/proxy/subscription_cache.h
+@@ -15,34 +15,43 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ namespace MTP::Proxy {
+ 
++struct SubscriptionServer {
++	VlessParams params;
++	bool enabled = true;
++};
++
+ struct SubscriptionEntry {
+-	QList<VlessParams> servers;
++	QList<SubscriptionServer> servers;
+ 	QDateTime fetchedAt;
+ 
+ 	[[nodiscard]] bool empty() const { return servers.isEmpty(); }
++	[[nodiscard]] QList<VlessParams> enabledParams() const;
+ };
+ 
+ // In-memory + disk-backed cache of fetched VLESS subscription server lists,
+ // keyed by the user-visible subscription URL (happ:// or https://).
+ //
+-// Servers are persisted as vless:// strings in a single JSON file under the
+-// application data dir; on next launch they are re-parsed via ParseVlessUrl.
+-// This lets a Type::VlessSubscription proxy connect at startup using the
+-// last known good server list, without requiring the user to open the
+-// proxy edit dialog and refresh first.
++// Each server entry carries an `enabled` flag so the user can pick a subset
++// of subscription servers; sing-box urltest only sees enabled ones via
++// SubscriptionEntry::enabledParams().
+ class SubscriptionCache final {
+ public:
+ 	static SubscriptionCache &instance();
+ 
+-	[[nodiscard]] QList<VlessParams> servers(
+-		const QString &subscriptionUrl);
+-
+ 	[[nodiscard]] SubscriptionEntry entry(
+ 		const QString &subscriptionUrl);
+ 
++	// Replace the server list (e.g., after a fresh fetch). Existing
++	// per-server `enabled` flags are preserved when the same vless://
++	// reappears in the new list; brand-new servers default to enabled.
+ 	void setServers(
+ 		const QString &subscriptionUrl,
+-		const QList<VlessParams> &servers);
++		const QList<VlessParams> &fetched);
++
++	void setServerEnabled(
++		const QString &subscriptionUrl,
++		int index,
++		bool enabled);
+ 
+ 	void clear(const QString &subscriptionUrl);
+ 
+-- 
+2.54.0.windows.1
+
