@@ -1,4 +1,4 @@
-From 70ae333077848bc959e75047b5fb1650f37d3393 Mon Sep 17 00:00:00 2001
+From 33f30cc67bd73f09c1a68f22fd4e5ffdd9085db5 Mon Sep 17 00:00:00 2001
 From: melnoff <melnoff360@gmail.com>
 Date: Sat, 25 Apr 2026 22:58:09 +0300
 Subject: [PATCH] feat(net): Clash API monitoring of subscription urltest
@@ -36,19 +36,19 @@ patch 12.
     rest. Refresh resets the monitor (sidecar gets restarted on next
     use).
 ---
- Telegram/CMakeLists.txt                       |   2 +
+ Telegram/CMakeLists.txt                       |   8 ++
  Telegram/SourceFiles/boxes/connection_box.cpp |  67 +++++++++-
  .../mtproto/proxy/subscription_monitor.cpp    | 121 ++++++++++++++++++
  .../mtproto/proxy/subscription_monitor.h      |  59 +++++++++
  .../mtproto/proxy/vless_bridge.cpp            |  42 ++++--
  .../SourceFiles/mtproto/proxy/vless_bridge.h  |  30 +++--
  Telegram/ThirdParty/singbox_bridge/bridge.go  |  69 ++++++++--
- 7 files changed, 355 insertions(+), 35 deletions(-)
+ 7 files changed, 361 insertions(+), 35 deletions(-)
  create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_monitor.cpp
  create mode 100644 Telegram/SourceFiles/mtproto/proxy/subscription_monitor.h
 
 diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
-index 3674ad6e69..36312bf45e 100644
+index 3674ad6e69..fc5935d9ac 100644
 --- a/Telegram/CMakeLists.txt
 +++ b/Telegram/CMakeLists.txt
 @@ -1445,6 +1445,8 @@ PRIVATE
@@ -60,6 +60,19 @@ index 3674ad6e69..36312bf45e 100644
      mtproto/special_config_request.cpp
      mtproto/special_config_request.h
      mtproto/type_utils.h
+@@ -1970,6 +1972,12 @@ if (WIN32)
+         target_link_libraries(Telegram PRIVATE desktop-app::win_directx_helper)
+     endif()
+ 
++    # Required by Qt6Network's qdnslookup_win.cpp (DnsQueryEx,
++    # DnsWriteQuestionToBuffer_W, DnsExtractRecordsFromMessage_W). The TU is
++    # pulled in once we link a translation unit that uses QNetworkAccessManager
++    # outside the singbox sidecar plumbing.
++    target_link_libraries(Telegram PRIVATE Dnsapi)
++
+     target_link_options(Telegram PRIVATE /PDBPAGESIZE:8192)
+ 
+     # Copy bundled sing-box sidecar DLL next to Telegram.exe so the VLESS
 diff --git a/Telegram/SourceFiles/boxes/connection_box.cpp b/Telegram/SourceFiles/boxes/connection_box.cpp
 index 26d19a71b2..4dba9198ab 100644
 --- a/Telegram/SourceFiles/boxes/connection_box.cpp
